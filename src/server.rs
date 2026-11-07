@@ -284,6 +284,7 @@ async fn run_https_configured(
     config: RustlsConfig,
 ) -> Result<()> {
     let mut shutdown = state.shutdown.subscribe();
+    let handshake_shutdown = state.shutdown.subscribe();
     let app = build_router(state);
     let addr = listener.local_addr()?;
     tracing::info!("Listening on https://{addr} (mTLS: client cert required)");
@@ -292,6 +293,10 @@ async fn run_https_configured(
     let std_listener = listener.into_std()?;
     let handle = axum_server::Handle::new();
     let server = axum_server::from_tcp_rustls(std_listener, config)
+        .map(|inner| ShutdownAcceptor {
+            inner,
+            shutdown: handshake_shutdown,
+        })
         .handle(handle.clone())
         .serve(app.into_make_service_with_connect_info::<SocketAddr>());
     tokio::pin!(server);
@@ -303,6 +308,59 @@ async fn run_https_configured(
         }
     }
     Ok(())
+}
+
+/// axum-server does not interrupt pending TLS handshakes during graceful
+/// shutdown. Cancel those explicitly so an idle TCP peer cannot delay Quit.
+#[derive(Clone)]
+struct ShutdownAcceptor<A> {
+    inner: A,
+    shutdown: watch::Receiver<bool>,
+}
+
+impl<I, S, A> axum_server::accept::Accept<I, S> for ShutdownAcceptor<A>
+where
+    A: axum_server::accept::Accept<I, S>,
+    A::Future: Send + 'static,
+{
+    type Stream = A::Stream;
+    type Service = A::Service;
+    type Future = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::io::Result<(Self::Stream, Self::Service)>> + Send,
+        >,
+    >;
+
+    fn accept(&self, stream: I, service: S) -> Self::Future {
+        let future = self.inner.accept(stream, service);
+        let mut shutdown = self.shutdown.clone();
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|stopped| *stopped) => {
+                    Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "Receiver shutting down"))
+                }
+                result = future => result,
+            }
+        })
+    }
+}
+
+/// JSON extraction can stall before a route handler runs. Wrap metadata routes
+/// so stopping the receiver also interrupts incomplete request bodies.
+async fn cancel_metadata_on_shutdown(
+    State(state): State<ServerState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut shutdown = state.shutdown.subscribe();
+    tokio::select! {
+        biased;
+        _ = shutdown.wait_for(|stopped| *stopped) => {
+            error_response(StatusCode::SERVICE_UNAVAILABLE, "Receiver shutting down")
+        }
+        response = next.run(request) => response,
+    }
 }
 
 fn build_router(state: ServerState) -> Router {
@@ -328,6 +386,11 @@ fn build_router(state: ServerState) -> Router {
         .route("/api/localsend/v1/cancel", post(cancel_handler))
         .route("/api/localsend/v2/cancel", post(cancel_handler))
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            cancel_metadata_on_shutdown,
+        ))
+        // Uploads cancel inside their handler and finish reservation cleanup.
         .merge(upload_routes)
         .with_state(state)
 }
@@ -1907,6 +1970,76 @@ mod integration_tests {
                 }
                 other => panic!("unexpected event: {other:?}"),
             }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_incomplete_metadata_bodies() {
+        for route in [
+            "v1/register",
+            "v2/register",
+            "v1/send-request",
+            "v2/prepare-upload",
+        ] {
+            let dir = fresh_dir("shutdown-json");
+            let state = make_state(&dir, None);
+            let request_state = state.clone();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let chunks = futures_util::stream::once(async move {
+                let _ = started_tx.send(());
+                Ok::<_, std::io::Error>("{")
+            })
+            .chain(futures_util::stream::pending());
+            let mut request = json_request("POST", &format!("/api/localsend/{route}"), None);
+            *request.body_mut() = Body::from_stream(chunks);
+            let response =
+                tokio::spawn(async move { call(&request_state, request, peer_addr()).await });
+            tokio::time::timeout(Duration::from_secs(1), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            state.shutdown();
+            let (status, _, _) = tokio::time::timeout(Duration::from_secs(1), response)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "route {route}");
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_an_unfinished_tls_handshake() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = fresh_dir("shutdown-handshake");
+        let mut state = make_state(&dir, None);
+        state.config.https = true;
+        state.identity = Identity::load_or_create(&dir.join("identity"), true).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = super::spawn_server(state.clone(), listener).unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Start a TLS record but never complete the ClientHello.
+        client.write_all(&[0x16]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        state.shutdown();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut byte = [0];
+        match tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte))
+            .await
+            .unwrap()
+        {
+            Ok(count) => assert_eq!(count, 0),
+            Err(error) => assert!(matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            )),
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
