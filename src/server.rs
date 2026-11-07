@@ -15,7 +15,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use futures_util::StreamExt;
 use localsend::http::dto::ErrorResponse;
 use localsend::http::dto_v2::{
-    InfoResponseDtoV2, PrepareUploadResponseDtoV2, RegisterDtoV2, RegisterResponseDtoV2,
+    InfoResponseDtoV2, PrepareUploadResponseDtoV2, RegisterResponseDtoV2,
 };
 use localsend::model::transfer::FileDto;
 use serde::Deserialize;
@@ -392,6 +392,7 @@ async fn info_v1_handler(
 
 async fn register_v1_handler(
     State(state): State<ServerState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<RegisterPayloadCompat>,
 ) -> Result<Json<InfoResponseJson>, Response> {
     let fingerprint = payload.fingerprint();
@@ -407,6 +408,7 @@ async fn register_v1_handler(
             "Self-discovered",
         ));
     }
+    record_registration(&state, addr, payload);
     Ok(Json(info_response_json(&state)))
 }
 
@@ -416,9 +418,39 @@ async fn info_handler(State(state): State<ServerState>) -> Json<InfoResponseDtoV
 
 async fn register_handler(
     State(state): State<ServerState>,
-    Json(_payload): Json<RegisterDtoV2>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(payload): Json<RegisterPayloadCompat>,
 ) -> Json<RegisterResponseDtoV2> {
+    record_registration(&state, addr, payload);
     Json(register_response(&state))
+}
+
+fn record_registration(state: &ServerState, addr: SocketAddr, payload: RegisterPayloadCompat) {
+    let fingerprint = payload.fingerprint().to_owned();
+    if fingerprint.is_empty() || fingerprint == state.identity.fingerprint {
+        return;
+    }
+    state.emit_event(ReceiveEvent::PeerDiscovered(
+        crate::discovery::DiscoveredDevice {
+            alias: payload.alias,
+            ip: addr.ip().to_string(),
+            port: payload.port.unwrap_or(state.config.port),
+            fingerprint,
+            https: payload
+                .protocol
+                .as_deref()
+                .map(|p| p.eq_ignore_ascii_case("https"))
+                .unwrap_or(state.config.https),
+            version: payload
+                .version
+                .unwrap_or_else(|| crate::config::PROTOCOL_VERSION.to_owned()),
+            device_type: payload
+                .device_type
+                .as_deref()
+                .and_then(crate::util::parse_device_type),
+            device_model: payload.device_model,
+        },
+    ));
 }
 
 async fn prepare_upload_v1_handler(
@@ -1844,6 +1876,39 @@ mod integration_tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["message"], "Self-discovered");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn registrations_report_peer_endpoints_on_both_protocol_versions() {
+        let dir = fresh_dir("registration-events");
+        let mut state = make_state(&dir, None);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.event_tx = Some(tx);
+        for version in ["v1", "v2"] {
+            let body = r#"{"alias":"Peer","fingerprint":"peer-fp","port":6000,"protocol":"http","version":"2.1"}"#;
+            let (status, _, _) = call(
+                &state,
+                json_request(
+                    "POST",
+                    &format!("/api/localsend/{version}/register"),
+                    Some(body),
+                ),
+                peer_addr(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            match rx.try_recv().unwrap() {
+                ReceiveEvent::PeerDiscovered(device) => {
+                    assert_eq!(device.ip, peer_addr().ip().to_string());
+                    assert_eq!(device.alias, "Peer");
+                    assert_eq!(device.port, 6000);
+                    assert!(!device.https);
+                    assert_eq!(device.fingerprint, "peer-fp");
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

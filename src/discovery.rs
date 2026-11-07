@@ -151,12 +151,12 @@ pub async fn run_responder(config: AppConfig, identity: Identity) -> Result<Mult
     let multicast_group: Ipv4Addr = DEFAULT_MULTICAST_GROUP.parse()?;
     let listen_sockets = open_multicast_listen_sockets(config.port, multicast_group)
         .context("Failed to open multicast listen sockets")?;
-    let guard =
+    let mut guard =
         start_multicast_listener(config.clone(), identity.clone(), None, listen_sockets).await?;
 
     let announce_config = config.clone();
     let announce_identity = identity.clone();
-    tokio::spawn(async move {
+    let announcement_task = tokio::spawn(async move {
         let announce_sockets = open_multicast_announce_sockets(multicast_group);
         if announce_sockets.is_empty() {
             return;
@@ -193,6 +193,7 @@ pub async fn run_responder(config: AppConfig, identity: Identity) -> Result<Mult
         }
     });
 
+    guard.tasks.push(announcement_task);
     Ok(guard)
 }
 

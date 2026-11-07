@@ -11,6 +11,9 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub enum ReceiveEvent {
+    /// Peer observed through the resident receiver's HTTP registration endpoint.
+    PeerDiscovered(crate::discovery::DiscoveredDevice),
+
     /// Emitted once after the receiver binds its listener and discovery responder.
     Ready {
         alias: String,

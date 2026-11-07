@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::config::AppConfig;
-use crate::discovery::resolve_target;
+use crate::discovery::{DiscoveredDevice, resolve_target};
 use crate::error::CliError;
 use crate::identity::Identity;
 use crate::network::build_http_client;
@@ -46,6 +46,18 @@ pub async fn send_files(
 ) -> Result<()> {
     let (device, resolved_via) =
         resolve_target(request.target, config, identity, !request.no_scan).await?;
+    send_files_to_device(config, identity, request, output, &device, resolved_via).await
+}
+
+/// Send to an already discovered endpoint without discarding its transport or port.
+pub async fn send_files_to_device(
+    config: &AppConfig,
+    identity: &Identity,
+    request: &SendRequest<'_>,
+    output: OutputOptions,
+    device: &DiscoveredDevice,
+    resolved_via: &'static str,
+) -> Result<()> {
     let is_message = is_message_send(
         request.text_stdin,
         request.message.is_some(),
@@ -62,7 +74,7 @@ pub async fn send_files(
         return Err(CliError::NoFiles.into());
     }
 
-    let client = build_http_client(identity, config.https)?;
+    let client = build_http_client(identity, device.https)?;
     let protocol = if device.https {
         ProtocolType::Https
     } else {
@@ -144,7 +156,7 @@ pub async fn send_files(
             println!("Message delivered.");
         } else if output.is_json() {
             print_json(&build_send_result(
-                &device,
+                device,
                 resolved_via,
                 is_message,
                 &files,
@@ -219,7 +231,7 @@ pub async fn send_files(
             "skipped"
         };
         print_json(&build_send_result(
-            &device,
+            device,
             resolved_via,
             is_message,
             &files,
@@ -568,9 +580,33 @@ mod tests {
             pin: None,
             no_scan: true,
         };
+        // The local receiver uses HTTPS on a different port; sending must use
+        // the selected peer's HTTP endpoint without changing our advertised identity.
+        let device = DiscoveredDevice {
+            alias: "Selected peer".into(),
+            ip: "127.0.0.1".into(),
+            port,
+            https: false,
+            fingerprint: "peer".into(),
+            version: "2.1".into(),
+            device_type: None,
+            device_model: None,
+        };
+        let local_config = AppConfig {
+            port: 1,
+            https: true,
+            ..config
+        };
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            send_files(&config, &identity, &request, OutputOptions::new(true, true)),
+            send_files_to_device(
+                &local_config,
+                &identity,
+                &request,
+                OutputOptions::new(true, true),
+                &device,
+                "scan",
+            ),
         )
         .await
         .unwrap()
