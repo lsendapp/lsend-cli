@@ -75,6 +75,7 @@ struct ReceivingFileEntry {
     desired_name: String,
     path: Option<PathBuf>,
     failed: bool,
+    uploading: bool,
 }
 
 struct PinAttempts {
@@ -158,10 +159,7 @@ impl ServerState {
         let Some(session) = session_slot.as_mut() else {
             return;
         };
-        let all_done = session
-            .files
-            .values()
-            .all(|f| f.path.is_some() || f.failed);
+        let all_done = session.files.values().all(|f| f.path.is_some() || f.failed);
         if !all_done {
             return;
         }
@@ -432,6 +430,7 @@ async fn prepare_upload_handler(
                 desired_name,
                 path: None,
                 failed: false,
+                uploading: false,
             },
         );
     }
@@ -801,43 +800,64 @@ async fn upload_handler(
         return error_response(StatusCode::FORBIDDEN, "Invalid token");
     }
 
+    if entry.uploading || entry.path.is_some() {
+        return error_response(StatusCode::CONFLICT, "File already uploaded or uploading");
+    }
     entry.failed = false;
+    entry.uploading = true;
 
+    let active_session_id = session.session_id.clone();
+    let expected_size = entry.file.size;
     let desired_name = entry.desired_name.clone();
     let destination_dir = session.destination_dir.clone();
     drop(guard);
 
-    let target_path = match prepare_receive_path(&destination_dir, &desired_name).await {
-        Ok(path) => path,
-        Err(message) => {
-            // Path validation failed (e.g. traversal). Mark the file as
-            // failed so the session can transition instead of getting stuck.
-            let mut guard = state.inner.lock().await;
-            if let Some(session) = guard.session.as_mut() {
-                if let Some(entry) = session.files.get_mut(&file_id) {
-                    entry.failed = true;
-                }
-                state.maybe_complete_session(&mut guard.session);
-            }
-            return error_response(StatusCode::FORBIDDEN, &message);
-        }
+    // Reserve and open the destination in a blocking task. cap-std resolves
+    // every path relative to a directory handle and disallows escapes.
+    let reserve_result = match validate_relative_file_name(&desired_name) {
+        Err(message) => Err((StatusCode::FORBIDDEN, message)),
+        Ok(()) => tokio::task::spawn_blocking(move || {
+            reserve_receive_file(&destination_dir, &desired_name)
+        })
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+        .and_then(|result| {
+            result.map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+        }),
     };
-
-    let save_result = save_stream(body, &target_path).await;
+    let mut reserved = None;
+    let save_result = match reserve_result {
+        Ok(file) => {
+            reserved = Some(file);
+            save_stream(body, reserved.as_mut().unwrap(), expected_size).await
+        }
+        Err(error) => Err(error),
+    };
 
     let mut guard = state.inner.lock().await;
     let Some(session) = guard.session.as_mut() else {
         return error_response(StatusCode::CONFLICT, "No session");
     };
+    // Cancellation may have replaced the session while the body was streaming.
+    if session.session_id != active_session_id {
+        return error_response(StatusCode::CONFLICT, "Session was cancelled");
+    }
     let Some(entry) = session.files.get_mut(&file_id) else {
         return error_response(StatusCode::FORBIDDEN, "Invalid token");
     };
+    entry.uploading = false;
 
     // Record the outcome without returning early on error: the session
     // transition check below must run even when the last file fails,
     // otherwise the session is stuck in `Sending` forever.
-    let save_error: Option<String> = match save_result {
+    let save_error = match save_result {
         Ok(bytes) => {
+            let reserved = reserved
+                .as_mut()
+                .expect("successful save has a reserved file");
+            reserved.keep = true;
+            let target_path = reserved.path.clone();
+            let desired_name = entry.desired_name.clone();
             entry.path = Some(target_path.clone());
             entry.failed = false;
             state.notify_human(format!("Saved {} ({} bytes)", target_path.display(), bytes));
@@ -857,7 +877,7 @@ async fn upload_handler(
         }
         Err(e) => {
             entry.failed = true;
-            Some(e.to_string())
+            Some(e)
         }
     };
 
@@ -866,7 +886,7 @@ async fn upload_handler(
     state.maybe_complete_session(&mut guard.session);
 
     match save_error {
-        Some(msg) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &msg),
+        Some((status, msg)) => error_response(status, &msg),
         None => StatusCode::OK.into_response(),
     }
 }
@@ -935,78 +955,99 @@ async fn cancel_handler(
     }
 }
 
-async fn save_stream(body: Body, path: &Path) -> Result<u64, anyhow::Error> {
-    let mut file = File::create(path).await?;
+/// Owns the reservation until a successful upload is committed. Failed,
+/// cancelled, or interrupted handlers remove their partial file on drop.
+struct ReservedReceiveFile {
+    file: Option<std::fs::File>,
+    parent: cap_std::fs::Dir,
+    name: std::ffi::OsString,
+    path: PathBuf,
+    keep: bool,
+}
+
+impl Drop for ReservedReceiveFile {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if !self.keep {
+            let _ = self.parent.remove_file(&self.name);
+        }
+    }
+}
+
+async fn save_stream(
+    body: Body,
+    reserved: &mut ReservedReceiveFile,
+    expected_size: u64,
+) -> Result<u64, (StatusCode, String)> {
+    let mut file = File::from_std(reserved.file.take().expect("reserved file"));
     let mut stream = body.into_data_stream();
     let mut total = 0u64;
+    let io_error = |e: std::io::Error| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        file.write_all(&chunk).await?;
+        let chunk = chunk.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        if chunk.len() as u64 > expected_size - total {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Upload exceeds advertised size".into(),
+            ));
+        }
+        file.write_all(&chunk).await.map_err(io_error)?;
         total += chunk.len() as u64;
     }
-
-    file.flush().await?;
+    if total != expected_size {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Upload shorter than advertised size".into(),
+        ));
+    }
+    file.flush().await.map_err(io_error)?;
     Ok(total)
 }
 
-async fn prepare_receive_path(destination_dir: &Path, file_name: &str) -> Result<PathBuf, String> {
-    let target_path = unique_path(destination_dir, file_name)?;
-    tokio::fs::create_dir_all(destination_dir)
-        .await
-        .map_err(|error| format!("Failed to create receive directory: {error}"))?;
-    if let Some(parent) = target_path.parent() {
-        if parent != destination_dir && !parent.starts_with(destination_dir) {
-            return Err("Path traversal is not allowed".to_string());
-        }
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|error| format!("Failed to create directory: {error}"))?;
-    }
-    Ok(target_path)
-}
-
-fn unique_path(dir: &Path, file_name: &str) -> Result<PathBuf, String> {
-    validate_relative_file_name(file_name)?;
-
+fn reserve_receive_file(dir: &Path, file_name: &str) -> Result<ReservedReceiveFile> {
+    validate_relative_file_name(file_name).map_err(anyhow::Error::msg)?;
+    std::fs::create_dir_all(dir)?;
+    let root = cap_std::fs::Dir::open_ambient_dir(dir, cap_std::ambient_authority())?;
     let relative = Path::new(file_name);
-    let parent_dir = relative
+    let parent_path = relative
         .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .map(|parent| dir.join(parent))
-        .unwrap_or_else(|| dir.to_path_buf());
-
-    if !parent_dir.starts_with(dir) {
-        return Err("Path traversal is not allowed".to_string());
-    }
-
-    let leaf = Path::new(
-        relative
-            .file_name()
-            .ok_or_else(|| "Invalid file name".to_string())?,
-    );
-    let stem = leaf
-        .file_stem()
-        .map(|value| value.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".to_string());
-    let ext = leaf
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    root.create_dir_all(parent_path)?;
+    let parent = root.open_dir(parent_path)?;
+    let leaf = relative
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Invalid file name"))?;
+    let leaf_path = Path::new(leaf);
+    let stem = leaf_path.file_stem().unwrap_or(leaf).to_string_lossy();
+    let ext = leaf_path
         .extension()
-        .map(|value| format!(".{}", value.to_string_lossy()))
+        .map(|e| format!(".{}", e.to_string_lossy()))
         .unwrap_or_default();
-
-    let mut candidate = parent_dir.join(leaf);
-    if !candidate.exists() {
-        return Ok(candidate);
-    }
-
-    for index in 1..1000 {
-        candidate = parent_dir.join(format!("{stem} ({index}){ext}"));
-        if !candidate.exists() {
-            return Ok(candidate);
+    let mut index = 0;
+    loop {
+        let name = match index {
+            0 => leaf.to_os_string(),
+            1..1000 => format!("{stem} ({index}){ext}").into(),
+            _ => format!("{stem}-{}{ext}", Uuid::new_v4()).into(),
+        };
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        match parent.open_with(&name, &options) {
+            Ok(file) => {
+                return Ok(ReservedReceiveFile {
+                    file: Some(file.into_std()),
+                    path: dir.join(parent_path).join(&name),
+                    parent,
+                    name,
+                    keep: false,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => index += 1,
+            Err(error) => return Err(error.into()),
         }
     }
-
-    Ok(parent_dir.join(format!("{stem}-{}{ext}", Uuid::new_v4())))
 }
 
 fn validate_relative_file_name(file_name: &str) -> Result<(), String> {
@@ -1089,7 +1130,10 @@ async fn check_pin(
 
     let entry = attempts_guard
         .entry(client_ip.to_string())
-        .or_insert_with(|| PinAttempts { count: 0, last: now });
+        .or_insert_with(|| PinAttempts {
+            count: 0,
+            last: now,
+        });
     if entry.count >= 3 {
         return Some(error_response(
             StatusCode::TOO_MANY_REQUESTS,
@@ -1133,7 +1177,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lsend-nested-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let resolved = unique_path(&dir, "photos/vacation/beach.jpg").expect("resolve");
+        let resolved = reserve_receive_file(&dir, "photos/vacation/beach.jpg")
+            .map(|file| file.path.clone())
+            .expect("resolve");
         assert_eq!(
             resolved,
             dir.join("photos").join("vacation").join("beach.jpg")
@@ -1145,8 +1191,8 @@ mod tests {
     #[test]
     fn unique_path_rejects_path_traversal() {
         let dir = std::env::temp_dir();
-        assert!(unique_path(&dir, "../escape.txt").is_err());
-        assert!(unique_path(&dir, "nested/../../escape.txt").is_err());
+        assert!(reserve_receive_file(&dir, "../escape.txt").is_err());
+        assert!(reserve_receive_file(&dir, "nested/../../escape.txt").is_err());
     }
 
     #[test]
@@ -1156,7 +1202,9 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("readme.md"), b"existing").unwrap();
 
-        let resolved = unique_path(&dir, "docs/readme.md").expect("resolve");
+        let resolved = reserve_receive_file(&dir, "docs/readme.md")
+            .map(|file| file.path.clone())
+            .expect("resolve");
         assert_eq!(resolved, nested.join("readme (1).md"));
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1516,7 +1564,9 @@ mod tests {
     fn unique_path_returns_original_when_no_collision() {
         let dir = std::env::temp_dir().join(format!("lsend-fresh-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let resolved = unique_path(&dir, "new.txt").expect("resolve");
+        let resolved = reserve_receive_file(&dir, "new.txt")
+            .map(|file| file.path.clone())
+            .expect("resolve");
         assert_eq!(resolved, dir.join("new.txt"));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1527,7 +1577,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), b"x").unwrap();
         std::fs::write(dir.join("a (1).txt"), b"x").unwrap();
-        let resolved = unique_path(&dir, "a.txt").expect("resolve");
+        let resolved = reserve_receive_file(&dir, "a.txt")
+            .map(|file| file.path.clone())
+            .expect("resolve");
         assert_eq!(resolved, dir.join("a (2).txt"));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1537,7 +1589,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lsend-ext-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("photo.png"), b"x").unwrap();
-        let resolved = unique_path(&dir, "photo.png").expect("resolve");
+        let resolved = reserve_receive_file(&dir, "photo.png")
+            .map(|file| file.path.clone())
+            .expect("resolve");
         assert_eq!(resolved, dir.join("photo (1).png"));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1547,7 +1601,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lsend-noext-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("README"), b"x").unwrap();
-        let resolved = unique_path(&dir, "README").expect("resolve");
+        let resolved = reserve_receive_file(&dir, "README")
+            .map(|file| file.path.clone())
+            .expect("resolve");
         assert_eq!(resolved, dir.join("README (1)"));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1561,7 +1617,9 @@ mod tests {
         for i in 1..1000 {
             std::fs::write(dir.join(format!("f ({i}).txt")), b"x").unwrap();
         }
-        let resolved = unique_path(&dir, "f.txt").expect("resolve");
+        let resolved = reserve_receive_file(&dir, "f.txt")
+            .map(|file| file.path.clone())
+            .expect("resolve");
         let name = resolved.file_name().unwrap().to_string_lossy().to_string();
         assert!(name.starts_with("f-"), "got: {name}");
         assert!(name.ends_with(".txt"), "got: {name}");
@@ -2230,13 +2288,8 @@ mod integration_tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = fresh_dir("upload-fail");
-        let cfg = AppConfig::new(
-            Some("Tester".into()),
-            53317,
-            true,
-            Some(dir.to_path_buf()),
-        )
-        .expect("config");
+        let cfg = AppConfig::new(Some("Tester".into()), 53317, true, Some(dir.to_path_buf()))
+            .expect("config");
         let identity = Identity {
             cert_pem: String::new(),
             key_pem: String::new(),
@@ -2301,5 +2354,165 @@ mod integration_tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+    async fn prepare_one(state: &ServerState, body: &str) -> serde_json::Value {
+        let (status, _, response) = call(
+            state,
+            json_request("POST", "/api/localsend/v2/prepare-upload", Some(body)),
+            peer_addr(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        serde_json::from_slice(&response).unwrap()
+    }
+
+    fn upload_request(session: &serde_json::Value, id: &str, body: Body) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/api/localsend/v2/upload?sessionId={}&fileId={id}&token={}",
+                session["sessionId"].as_str().unwrap(),
+                session["files"][id].as_str().unwrap()
+            ))
+            .body(body)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_lengths_removes_partial_files_and_allows_retry() {
+        for (bytes, expected) in [
+            ("abc", StatusCode::BAD_REQUEST),
+            ("abcde", StatusCode::PAYLOAD_TOO_LARGE),
+        ] {
+            let dir = fresh_dir("size");
+            let state = make_state(&dir, None);
+            let session = prepare_one(&state, &make_prepare_body("2.1", 1)).await;
+            let (status, _, _) = call(
+                &state,
+                upload_request(&session, "f1", Body::from(bytes)),
+                peer_addr(),
+            )
+            .await;
+            assert_eq!(status, expected);
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+            let (status, _, _) = call(
+                &state,
+                upload_request(&session, "f1", Body::from("abcd")),
+                peer_addr(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(std::fs::read(dir.join("a0.bin")).unwrap(), b"abcd");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_cannot_escape_through_directory_symlink() {
+        let dir = fresh_dir("symlink-inbox");
+        let outside = fresh_dir("symlink-outside");
+        std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
+        let state = make_state(&dir, None);
+        let body = make_prepare_body("2.1", 1).replace("a0.bin", "link/escape.bin");
+        let session = prepare_one(&state, &body).await;
+        let (status, _, _) = call(
+            &state,
+            upload_request(&session, "f1", Body::from("abcd")),
+            peer_addr(),
+        )
+        .await;
+        assert!(!status.is_success());
+        assert!(!outside.join("escape.bin").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[tokio::test]
+    async fn parallel_uploads_with_same_name_preserve_both_files() {
+        let dir = fresh_dir("parallel-names");
+        let state = make_state(&dir, None);
+        let body = make_prepare_body("2.1", 2).replace("a1.bin", "a0.bin");
+        let session = prepare_one(&state, &body).await;
+        let (first, second) = tokio::join!(
+            call(
+                &state,
+                upload_request(&session, "f1", Body::from("aaaa")),
+                peer_addr()
+            ),
+            call(
+                &state,
+                upload_request(&session, "f2", Body::from("bbbb")),
+                peer_addr()
+            ),
+        );
+        assert_eq!(first.0, StatusCode::OK);
+        assert_eq!(second.0, StatusCode::OK);
+        let mut contents: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+            .collect();
+        contents.sort();
+        assert_eq!(contents, vec![b"aaaa".to_vec(), b"bbbb".to_vec()]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_upload_does_not_complete_replacement_session() {
+        let dir = fresh_dir("cancel-stream");
+        let state = make_state(&dir, None);
+        let body = make_prepare_body("2.1", 1);
+        let session = prepare_one(&state, &body).await;
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let stream =
+            futures_util::stream::unfold((rx, Some(started_tx)), |(mut rx, started)| async move {
+                if let Some(started) = started {
+                    let _ = started.send(());
+                }
+                rx.recv()
+                    .await
+                    .map(|data| (Ok::<_, std::io::Error>(data), (rx, None)))
+            });
+        let request = upload_request(&session, "f1", Body::from_stream(stream));
+        let upload_state = state.clone();
+        let upload = tokio::spawn(async move { call(&upload_state, request, peer_addr()).await });
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let cancel = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/api/localsend/v2/cancel?sessionId={}",
+                session["sessionId"].as_str().unwrap()
+            ))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(call(&state, cancel, peer_addr()).await.0, StatusCode::OK);
+        let replacement = prepare_one(&state, &body).await;
+        tx.send(b"abcd".to_vec()).await.unwrap();
+        drop(tx);
+        assert_eq!(upload.await.unwrap().0, StatusCode::CONFLICT);
+        let guard = state.inner.lock().await;
+        let active = guard.session.as_ref().unwrap();
+        assert_eq!(
+            active.session_id,
+            replacement["sessionId"].as_str().unwrap()
+        );
+        assert!(active.files["f1"].path.is_none());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        drop(guard);
+        assert_eq!(
+            call(
+                &state,
+                upload_request(&replacement, "f1", Body::from("abcd")),
+                peer_addr()
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

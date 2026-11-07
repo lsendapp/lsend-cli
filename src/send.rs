@@ -44,9 +44,20 @@ pub async fn send_files(
     request: &SendRequest<'_>,
     output: OutputOptions,
 ) -> Result<()> {
-    let (device, resolved_via) = resolve_target(request.target, config, identity, !request.no_scan).await?;
-    let is_message = is_message_send(request.text_stdin, request.message.is_some(), request.clipboard);
-    let files = collect_inputs(request.paths, request.text_stdin, request.message, request.clipboard).await?;
+    let (device, resolved_via) =
+        resolve_target(request.target, config, identity, !request.no_scan).await?;
+    let is_message = is_message_send(
+        request.text_stdin,
+        request.message.is_some(),
+        request.clipboard,
+    );
+    let files = collect_inputs(
+        request.paths,
+        request.text_stdin,
+        request.message,
+        request.clipboard,
+    )
+    .await?;
     if files.is_empty() {
         return Err(CliError::NoFiles.into());
     }
@@ -148,39 +159,57 @@ pub async fn send_files(
         .response
         .context("Missing prepare-upload response body")?;
 
-    for local in &files {
-        let Some(token) = response.files.get(&local.id) else {
-            if output.show_human_progress() {
-                println!("Skipped (not accepted): {}", local.file_name);
-            }
+    let transfer_result: Result<()> = async {
+        for local in &files {
+            let Some(token) = response.files.get(&local.id) else {
+                if output.show_human_progress() {
+                    println!("Skipped (not accepted): {}", local.file_name);
+                }
+                results.push(SendFileResult {
+                    name: local.file_name.clone(),
+                    path: local.display_source(),
+                    size: local.size,
+                    status: "skipped",
+                });
+                continue;
+            };
+
+            upload_file(
+                &client,
+                &protocol,
+                &device.ip,
+                device.port,
+                &response.session_id,
+                local,
+                token,
+                output,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Upload failed for {}: {e}", local.file_name))?;
+
             results.push(SendFileResult {
                 name: local.file_name.clone(),
                 path: local.display_source(),
                 size: local.size,
-                status: "skipped",
+                status: "finished",
             });
-            continue;
-        };
+        }
 
-        upload_file(
+        Ok(())
+    }
+    .await;
+    if let Err(error) = transfer_result {
+        // A failed file leaves the receiver waiting for the rest of the batch.
+        // Release its session, but preserve the upload error if cleanup fails.
+        cancel_failed_transfer(
             &client,
             &protocol,
             &device.ip,
             device.port,
             &response.session_id,
-            local,
-            token,
-            output,
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("Upload failed for {}: {e}", local.file_name))?;
-
-        results.push(SendFileResult {
-            name: local.file_name.clone(),
-            path: local.display_source(),
-            size: local.size,
-            status: "finished",
-        });
+        .await;
+        return Err(error);
     }
 
     if output.is_json() {
@@ -202,6 +231,27 @@ pub async fn send_files(
     }
 
     Ok(())
+}
+
+async fn cancel_failed_transfer(
+    client: &LsHttpClient,
+    protocol: &ProtocolType,
+    ip: &str,
+    port: u16,
+    session_id: &str,
+) {
+    if let LsHttpClient::V2(client) = client {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.cancel(protocol.clone(), ip, port, session_id),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!("Failed to cancel transfer: {error}"),
+            Err(_) => tracing::warn!("Timed out cancelling transfer"),
+        }
+    }
 }
 
 async fn upload_file(
@@ -453,6 +503,83 @@ fn local_file_from_path(path: &Path, file_name: &str) -> Result<LocalFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_upload_cancels_the_negotiated_session() {
+        use axum::http::StatusCode;
+        use axum::{Json, Router, extract::Query, routing::post};
+        let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let app = Router::new()
+            .route(
+                "/api/localsend/v2/prepare-upload",
+                post(|Json(payload): Json<serde_json::Value>| async move {
+                    let tokens: serde_json::Map<String, serde_json::Value> = payload["files"]
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .map(|id| (id.clone(), serde_json::json!("token")))
+                        .collect();
+                    Json(serde_json::json!({"sessionId": "failed-session", "files": tokens}))
+                }),
+            )
+            .route(
+                "/api/localsend/v2/upload",
+                post(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            )
+            .route(
+                "/api/localsend/v2/cancel",
+                post(move |Query(params): Query<HashMap<String, String>>| {
+                    let tx = cancel_tx.clone();
+                    async move {
+                        tx.send(params["sessionId"].clone()).unwrap();
+                        StatusCode::OK
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = std::env::temp_dir().join(format!("lsend-send-cancel-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.bin");
+        std::fs::write(&path, b"abcd").unwrap();
+        let config = AppConfig {
+            alias: "Tester".into(),
+            port,
+            https: false,
+            multicast_group: crate::config::DEFAULT_MULTICAST_GROUP.into(),
+            config_dir: dir.clone(),
+            receive_dir: dir.clone(),
+        };
+        let identity = Identity {
+            cert_pem: String::new(),
+            key_pem: String::new(),
+            fingerprint: "test".into(),
+        };
+        let paths = vec![path.to_string_lossy().into_owned()];
+        let request = SendRequest {
+            target: "127.0.0.1",
+            paths: &paths,
+            text_stdin: false,
+            message: None,
+            clipboard: false,
+            pin: None,
+            no_scan: true,
+        };
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            send_files(&config, &identity, &request, OutputOptions::new(true, true)),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().starts_with("Upload failed for test.bin:"));
+        assert_eq!(cancel_rx.try_recv().unwrap(), "failed-session");
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn rejects_mixed_paths_and_text_modes() {
