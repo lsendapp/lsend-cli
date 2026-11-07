@@ -17,6 +17,8 @@ path = "src/lib.rs"
 localsend = { path = "vendor/localsend-core", default-features = false, features = ["http"] }
 
 tokio = { version = "1.49", features = ["full"] }
+tokio-util = "0.7"
+bytes = "1"
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
 cap-std = "4"

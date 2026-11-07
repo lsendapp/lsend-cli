@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use localsend::http::dto::ProtocolType;
+use localsend::model::discovery::ProtocolType;
 use serde::Deserialize;
 use tokio::time::timeout;
 use tracing::info;

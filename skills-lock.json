@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "localsend-cli": {
+      "source": "lsendapp/cli",
+      "sourceType": "github",
+      "skillPath": "skills/localsend-cli/SKILL.md",
+      "computedHash": "00fd9a13a332ae4e4f10d5b88ee55b884cf94233c11909148a8c5bdd3c3c5eed"
+    }
+  }
+}

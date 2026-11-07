@@ -5,9 +5,9 @@ Vendored copy of `core/` from the upstream LocalSend monorepo.
 | Field        | Value                                                              |
 |--------------|--------------------------------------------------------------------|
 | Source       | https://github.com/localsend/localsend                             |
-| Subdirectory | `core/`                                                            |
-| Commit       | `90de693a9b1b04b48a8382a89e609bad433255bd`                         |
-| Date         | 2026-03-03                                                         |
+| Subdirectory | `packages/core/` (was `core/` before 1034fbd)                      |
+| Commit       | `d84fcb2bfe3fc151ec80e14703eb2482b55915e5`                         |
+| Date         | 2026-10-25                                                         |
 | Upstream license | Apache-2.0 — Copyright 2022-2024 Tien Do Nam               |
 
 ## License

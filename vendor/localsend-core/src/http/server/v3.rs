@@ -1,7 +1,7 @@
 use crate::http::dto::{NonceRequest, NonceResponse, RegisterDto, RegisterResponseDto};
-use crate::http::server::collect_to_json::CollectToJson;
-use crate::http::server::error::AppError;
-use crate::http::server::response::JsonResponse;
+use crate::http::server::common::collect_to_json::CollectToJson;
+use crate::http::server::common::error::AppError;
+use crate::http::server::common::response::JsonResponse;
 use crate::http::server::{AppState, RequestClientInfo};
 use crate::{crypto, util};
 use hyper::body::Incoming;
@@ -49,6 +49,8 @@ pub(crate) async fn nonce_exchange(
     })
 }
 
+// TODO: not wired up yet
+#[allow(unused)]
 pub(crate) async fn register(
     body: Incoming,
     state: AppState,
@@ -57,7 +59,7 @@ pub(crate) async fn register(
     let payload = body.collect_to_json::<RegisterDto>().await?;
 
     let info = state.info.lock().await.clone();
-    let has_web_interface = state.web.lock().await.is_some();
+    let has_web_interface = state.web.share.download().is_some();
 
     Ok(JsonResponse {
         status: StatusCode::OK,

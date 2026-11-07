@@ -4,9 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use localsend::http::dto::{ProtocolType, RegisterDto};
-use localsend::http::dto_v2::ProtocolTypeV2;
-use localsend::model::discovery::DeviceType;
+use localsend::http::dto::RegisterDto;
+use localsend::model::discovery::{DeviceType, ProtocolType};
 use serde::Deserialize;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
@@ -500,9 +499,9 @@ fn build_multicast_message(
         fingerprint: identity.fingerprint.clone(),
         port: Some(config.port),
         protocol: Some(if config.https {
-            ProtocolTypeV2::Https
+            ProtocolTypeCompat::Https
         } else {
-            ProtocolTypeV2::Http
+            ProtocolTypeCompat::Http
         }),
         download: false,
         announce,
@@ -524,7 +523,7 @@ fn message_to_device(
         https: message
             .protocol
             .as_ref()
-            .map(|p| *p == ProtocolTypeV2::Https)
+            .map(|p| *p == ProtocolTypeCompat::Https)
             .unwrap_or(fallback_https),
         version: message
             .version
@@ -587,6 +586,17 @@ fn looks_like_ip(value: &str) -> bool {
     value.parse::<IpAddr>().is_ok()
 }
 
+/// Wire representation of the multicast `protocol` field.
+///
+/// The core crate's `ProtocolType` serializes as SCREAMING_SNAKE_CASE for the
+/// v3 protocol, while multicast announcements use lowercase v2.1 values.
+#[derive(Clone, Copy, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum ProtocolTypeCompat {
+    Http,
+    Https,
+}
+
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MulticastMessageCompat {
@@ -601,7 +611,7 @@ struct MulticastMessageCompat {
     #[serde(default)]
     port: Option<u16>,
     #[serde(default)]
-    protocol: Option<ProtocolTypeV2>,
+    protocol: Option<ProtocolTypeCompat>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     download: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -661,7 +671,7 @@ mod tests {
             device_type: Some("headless".to_string()),
             fingerprint: "f".into(),
             port: Some(53317),
-            protocol: Some(ProtocolTypeV2::Https),
+            protocol: Some(ProtocolTypeCompat::Https),
             download: false,
             announce: true,
             announcement: true,

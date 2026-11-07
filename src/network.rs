@@ -81,6 +81,8 @@ pub fn build_http_client(identity: &Identity, https: bool) -> Result<LsHttpClien
             &identity.key_pem,
             &identity.cert_pem,
             LsHttpClientVersion::V2,
+            None,
+            None,
         )?)
     } else {
         Ok(LsHttpClient::V2(

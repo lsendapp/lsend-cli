@@ -1,7 +1,5 @@
 use crate::http::dto::ErrorResponse;
-use crate::http::server::response::JsonResponse;
-use bytes::Bytes;
-use http_body_util::Full;
+use crate::http::server::common::response::{BoxedBody, JsonResponse};
 use hyper::{Response, StatusCode};
 
 #[derive(Debug, thiserror::Error)]
@@ -14,10 +12,13 @@ pub enum AppError {
 
     #[error("Invalid request: {0}")]
     BadRequest(String),
+
+    #[error("{0}: {1}")]
+    Message(StatusCode, String),
 }
 
 impl AppError {
-    pub(crate) fn to_response(self) -> Response<Full<Bytes>> {
+    pub(crate) fn to_response(self) -> Response<BoxedBody> {
         let json = match self {
             AppError::Hyper(_) => JsonResponse {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -33,6 +34,10 @@ impl AppError {
             },
             AppError::BadRequest(message) => JsonResponse {
                 status: StatusCode::BAD_REQUEST,
+                body: ErrorResponse { message },
+            },
+            AppError::Message(status, message) => JsonResponse {
+                status,
                 body: ErrorResponse { message },
             },
         };

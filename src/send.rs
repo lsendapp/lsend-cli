@@ -2,14 +2,16 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use bytes::Bytes;
 use indicatif::{ProgressBar, ProgressStyle};
 use localsend::http::client::LsHttpClient;
-use localsend::http::dto::ProtocolType;
-use localsend::http::dto_v2::{PrepareUploadRequestDtoV2, ProtocolTypeV2, RegisterDtoV2};
-use localsend::model::transfer::FileDto;
+use localsend::http::dto_v2::{PrepareUploadRequestDtoV2, RegisterDtoV2};
+use localsend::model::discovery::ProtocolType;
+use localsend::model::transfer::{FileContent, FileDto};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::AppConfig;
@@ -89,9 +91,9 @@ pub async fn send_files_to_device(
         fingerprint: identity.fingerprint.clone(),
         port: config.port,
         protocol: if config.https {
-            ProtocolTypeV2::Https
+            ProtocolType::Https
         } else {
-            ProtocolTypeV2::Http
+            ProtocolType::Http
         },
         download: false,
     };
@@ -143,6 +145,7 @@ pub async fn send_files_to_device(
                 None,
                 prepare_payload,
                 request.pin,
+                CancellationToken::new(),
             )
             .await?
         }
@@ -286,7 +289,7 @@ async fn upload_file(
         pb.set_message(local.file_name.clone());
         pb
     });
-    let progress_for_reader = progress.clone();
+    let progress_for_upload = progress.clone();
 
     let (tx, rx) = mpsc::channel(4);
     let source = local.source.clone();
@@ -301,21 +304,15 @@ async fn upload_file(
                     if n == 0 {
                         break;
                     }
-                    if tx.send(buffer[..n].to_vec()).await.is_err() {
+                    if tx.send(Bytes::copy_from_slice(&buffer[..n])).await.is_err() {
                         break;
-                    }
-                    if let Some(pb) = &progress_for_reader {
-                        pb.inc(n as u64);
                     }
                 }
             }
             FileSource::Memory { data, .. } => {
                 for chunk in data.chunks(CHUNK_SIZE) {
-                    if tx.send(chunk.to_vec()).await.is_err() {
+                    if tx.send(Bytes::copy_from_slice(chunk)).await.is_err() {
                         break;
-                    }
-                    if let Some(pb) = &progress_for_reader {
-                        pb.inc(chunk.len() as u64);
                     }
                 }
             }
@@ -324,18 +321,25 @@ async fn upload_file(
     });
 
     let upload_result = match client {
-        LsHttpClient::V2(c) => {
-            c.upload(
-                protocol.clone(),
-                ip,
-                port,
-                None,
-                session_id,
-                &local.id,
-                token,
-                rx,
-            )
-            .await
+        LsHttpClient::V2(_) => {
+            client
+                .upload(
+                    protocol.clone(),
+                    ip,
+                    port,
+                    None,
+                    session_id,
+                    &local.id,
+                    token,
+                    FileContent::Stream(rx),
+                    move |bytes_sent| {
+                        if let Some(pb) = &progress_for_upload {
+                            pb.set_position(bytes_sent);
+                        }
+                    },
+                    CancellationToken::new(),
+                )
+                .await
         }
         LsHttpClient::V3(_) => bail!("v3 client is not supported by this CLI"),
     };
