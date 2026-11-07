@@ -22,7 +22,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use uuid::Uuid;
 
 use crate::config::AppConfig;
@@ -33,6 +33,9 @@ use crate::output::{OutputMode, ReceiveEventJson, print_json};
 /// Delay before returning 204 for embedded text messages so the mobile sender
 /// can finish its SendPage transition before reading the response.
 const TEXT_MESSAGE_RESPONSE_DELAY: Duration = Duration::from_millis(1200);
+/// Reclaim abandoned negotiations after five minutes without an upload.
+/// Streaming uploads have a separate per-chunk idle timeout of the same length.
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Discard PIN attempt counters after this idle period to bound memory in
 /// long-running receivers (desktop app). Also prevents permanent lockout.
 const PIN_ATTEMPTS_TTL: Duration = Duration::from_secs(300);
@@ -45,6 +48,7 @@ pub struct ServerState {
     stop_after_transfer: bool,
     stop_tx: Option<mpsc::UnboundedSender<()>>,
     event_tx: Option<mpsc::UnboundedSender<ReceiveEvent>>,
+    shutdown: watch::Sender<bool>,
     inner: Arc<Mutex<InnerState>>,
     pin_attempts: Arc<Mutex<HashMap<String, PinAttempts>>>,
 }
@@ -54,6 +58,7 @@ struct InnerState {
 }
 
 struct ReceiveSession {
+    last_activity: Instant,
     session_id: String,
     sender_ip: String,
     sender_version: String,
@@ -123,8 +128,26 @@ impl ServerState {
             stop_after_transfer,
             stop_tx,
             event_tx,
+            shutdown: watch::channel(false).0,
             inner: Arc::new(Mutex::new(InnerState { session: None })),
             pin_attempts: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Stop accepting work and cancel streaming uploads so their reservations clean up.
+    pub fn shutdown(&self) {
+        self.shutdown.send_replace(true);
+    }
+
+    fn expire_idle_session(&self, slot: &mut Option<ReceiveSession>) {
+        if slot.as_ref().is_some_and(|session| {
+            session.last_activity.elapsed() >= SESSION_IDLE_TIMEOUT
+                && !session.files.values().any(|file| file.uploading)
+        }) {
+            *slot = None;
+            self.notify_human("Abandoned transfer expired.");
+            self.emit_json_event(ReceiveEventJson::TransferCancelled);
+            self.emit_event(ReceiveEvent::TransferCancelled);
         }
     }
 
@@ -190,29 +213,33 @@ impl ServerState {
 }
 
 pub async fn run_http(state: ServerState, listener: tokio::net::TcpListener) -> Result<()> {
+    let mut shutdown = state.shutdown.subscribe();
     let app = build_router(state);
     tracing::info!("Listening on http://{}", listener.local_addr()?);
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown.wait_for(|stopped| *stopped).await;
+    })
     .await?;
     Ok(())
 }
 
-pub async fn run_https(state: ServerState, listener: tokio::net::TcpListener) -> Result<()> {
+fn prepare_tls(identity: &Identity) -> Result<RustlsConfig> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     use rustls::pki_types::pem::PemObject;
 
     let certs: Vec<rustls::pki_types::CertificateDer<'static>> = vec![
-        rustls::pki_types::CertificateDer::from_pem_slice(state.identity.cert_pem.as_bytes())
+        rustls::pki_types::CertificateDer::from_pem_slice(identity.cert_pem.as_bytes())
             .map_err(|e| anyhow::anyhow!("Failed to parse certificate: {e}"))?,
     ];
-    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(state.identity.key_pem.as_bytes())
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(identity.key_pem.as_bytes())
         .map_err(|e| anyhow::anyhow!("Failed to parse private key: {e}"))?;
 
-    let verifier = crate::mtls::LocalSendClientCertVerifier::try_new(&state.identity.cert_pem)
+    let verifier = crate::mtls::LocalSendClientCertVerifier::try_new(&identity.cert_pem)
         .map_err(|e| anyhow::anyhow!("Failed to build client cert verifier: {e:#}"))?;
 
     let server_config = rustls::ServerConfig::builder()
@@ -225,17 +252,56 @@ pub async fn run_https(state: ServerState, listener: tokio::net::TcpListener) ->
     let mut server_config = server_config;
     server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
-    let config = RustlsConfig::from_config(Arc::new(server_config));
+    Ok(RustlsConfig::from_config(Arc::new(server_config)))
+}
 
+/// Finish fallible TLS setup before the caller announces readiness.
+pub(crate) fn spawn_server(
+    state: ServerState,
+    listener: tokio::net::TcpListener,
+) -> Result<tokio::task::JoinHandle<Result<()>>> {
+    let tls = if state.config.https {
+        Some(prepare_tls(&state.identity)?)
+    } else {
+        None
+    };
+    Ok(tokio::spawn(async move {
+        match tls {
+            Some(config) => run_https_configured(state, listener, config).await,
+            None => run_http(state, listener).await,
+        }
+    }))
+}
+
+pub async fn run_https(state: ServerState, listener: tokio::net::TcpListener) -> Result<()> {
+    let config = prepare_tls(&state.identity)?;
+    run_https_configured(state, listener, config).await
+}
+
+async fn run_https_configured(
+    state: ServerState,
+    listener: tokio::net::TcpListener,
+    config: RustlsConfig,
+) -> Result<()> {
+    let mut shutdown = state.shutdown.subscribe();
     let app = build_router(state);
     let addr = listener.local_addr()?;
     tracing::info!("Listening on https://{addr} (mTLS: client cert required)");
     // Convert the tokio listener to std for axum-server; the port is already
     // bound so discovery can announce immediately after this returns.
     let std_listener = listener.into_std()?;
-    axum_server::from_tcp_rustls(std_listener, config)
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-        .await?;
+    let handle = axum_server::Handle::new();
+    let server = axum_server::from_tcp_rustls(std_listener, config)
+        .handle(handle.clone())
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>());
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result?,
+        _ = async { let _ = shutdown.wait_for(|stopped| *stopped).await; } => {
+            handle.graceful_shutdown(None);
+            server.await?;
+        }
+    }
     Ok(())
 }
 
@@ -403,7 +469,8 @@ async fn prepare_upload_handler(
     }
 
     if let Some(text) = extract_embedded_text_message(&request.files) {
-        let guard = state.inner.lock().await;
+        let mut guard = state.inner.lock().await;
+        state.expire_idle_session(&mut guard.session);
         if guard.session.is_some() {
             return error_response(StatusCode::CONFLICT, "Blocked by another session");
         }
@@ -439,6 +506,7 @@ async fn prepare_upload_handler(
     // section to close the TOCTOU window between the conflict check and
     // session installation.
     let mut guard = state.inner.lock().await;
+    state.expire_idle_session(&mut guard.session);
     if guard.session.is_some() {
         return error_response(StatusCode::CONFLICT, "Blocked by another session");
     }
@@ -462,6 +530,7 @@ async fn prepare_upload_handler(
     });
 
     guard.session = Some(ReceiveSession {
+        last_activity: Instant::now(),
         session_id: session_id.clone(),
         sender_ip,
         sender_version: request.sender_version,
@@ -764,6 +833,7 @@ async fn upload_handler(
     };
 
     let mut guard = state.inner.lock().await;
+    state.expire_idle_session(&mut guard.session);
     let Some(session) = guard.session.as_mut() else {
         return error_response(StatusCode::CONFLICT, "No session");
     };
@@ -805,6 +875,7 @@ async fn upload_handler(
     }
     entry.failed = false;
     entry.uploading = true;
+    session.last_activity = Instant::now();
 
     let active_session_id = session.session_id.clone();
     let expected_size = entry.file.size;
@@ -829,7 +900,14 @@ async fn upload_handler(
     let save_result = match reserve_result {
         Ok(file) => {
             reserved = Some(file);
-            save_stream(body, reserved.as_mut().unwrap(), expected_size).await
+            let mut shutdown = state.shutdown.subscribe();
+            tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|stopped| *stopped) => {
+                    Err((StatusCode::SERVICE_UNAVAILABLE, "Receiver shutting down".to_owned()))
+                }
+                result = save_stream(body, reserved.as_mut().unwrap(), expected_size) => result,
+            }
         }
         Err(error) => Err(error),
     };
@@ -846,6 +924,7 @@ async fn upload_handler(
         return error_response(StatusCode::FORBIDDEN, "Invalid token");
     };
     entry.uploading = false;
+    session.last_activity = Instant::now();
 
     // Record the outcome without returning early on error: the session
     // transition check below must run even when the last file fails,
@@ -984,7 +1063,10 @@ async fn save_stream(
     let mut total = 0u64;
     let io_error = |e: std::io::Error| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
 
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = tokio::time::timeout(SESSION_IDLE_TIMEOUT, stream.next())
+        .await
+        .map_err(|_| (StatusCode::REQUEST_TIMEOUT, "Upload stalled".to_owned()))?
+    {
         let chunk = chunk.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         if chunk.len() as u64 > expected_size - total {
             return Err((
@@ -1306,6 +1388,7 @@ mod tests {
 
     fn dummy_session(id: &str, ip: &str, version: &str, status: SessionStatus) -> ReceiveSession {
         ReceiveSession {
+            last_activity: Instant::now(),
             session_id: id.to_string(),
             sender_ip: ip.to_string(),
             sender_version: version.to_string(),
@@ -1761,6 +1844,71 @@ mod integration_tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["message"], "Self-discovered");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_stalled_upload_and_removes_partial_file() {
+        for https in [false, true] {
+            let dir = fresh_dir("shutdown-upload");
+            let mut state = make_state(&dir, None);
+            state.config.https = https;
+            state.identity = Identity::load_or_create(&dir.join("identity"), https).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server_state = state.clone();
+            let server = tokio::spawn(async move {
+                if https {
+                    run_https(server_state, listener).await
+                } else {
+                    run_http(server_state, listener).await
+                }
+            });
+            let client = crate::network::build_reqwest_client(&state.identity, https).unwrap();
+            let base = format!(
+                "{}://127.0.0.1:{port}/api/localsend/v2",
+                if https { "https" } else { "http" }
+            );
+            let prepared: serde_json::Value = client.post(format!("{base}/prepare-upload"))
+                .json(&serde_json::json!({
+                    "info": {"alias": "Sender", "version": "2.1"},
+                    "files": {"f1": {"id": "f1", "fileName": "partial.bin", "size": 1000000, "fileType": "application/octet-stream"}}
+                })).send().await.unwrap().json().await.unwrap();
+            let session = prepared["sessionId"].as_str().unwrap();
+            let token = prepared["files"]["f1"].as_str().unwrap();
+            let (chunk_tx, chunk_rx) = mpsc::unbounded_channel::<Result<Vec<u8>, std::io::Error>>();
+            chunk_tx.send(Ok(vec![42; 4])).unwrap();
+            let stream = futures_util::stream::unfold(chunk_rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| (chunk, rx))
+            });
+            let upload = tokio::spawn(
+                client
+                    .post(format!(
+                        "{base}/upload?sessionId={session}&fileId=f1&token={token}"
+                    ))
+                    .body(localsend::reqwest::Body::wrap_stream(stream))
+                    .send(),
+            );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !dir.join("partial.bin").exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            state.shutdown();
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(
+                !dir.join("partial.bin").exists(),
+                "shutdown left a partial file (https={https})"
+            );
+            drop(chunk_tx);
+            let _ = upload.await;
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -2355,6 +2503,139 @@ mod integration_tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+    #[tokio::test]
+    async fn abandoned_sessions_allow_new_file_and_message_transfers() {
+        for failed in [false, true] {
+            let dir = fresh_dir("expire");
+            let state = make_state(&dir, None);
+            let body = make_prepare_body("2.1", 1);
+            let previous = prepare_one(&state, &body).await;
+            // Fresh negotiations must still block competing senders.
+            let (status, _, _) = call(
+                &state,
+                json_request("POST", "/api/localsend/v2/prepare-upload", Some(&body)),
+                peer_addr(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            {
+                let mut guard = state.inner.lock().await;
+                let session = guard.session.as_mut().unwrap();
+                session.last_activity = Instant::now() - SESSION_IDLE_TIMEOUT;
+                if failed {
+                    session.status = SessionStatus::FinishedWithErrors;
+                }
+            }
+            let replacement = prepare_one(&state, &body).await;
+            assert_ne!(previous["sessionId"], replacement["sessionId"]);
+            // Old credentials cannot write into the replacement session.
+            let (status, _, _) = call(
+                &state,
+                upload_request(&previous, "f1", Body::from("abcd")),
+                peer_addr(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            {
+                let mut guard = state.inner.lock().await;
+                guard.session.as_mut().unwrap().last_activity =
+                    Instant::now() - SESSION_IDLE_TIMEOUT;
+            }
+            let message = serde_json::json!({
+                "info": {"alias": "Sender", "version": "2.1"},
+                "files": {"text": {"fileName": "text.txt", "size": 2, "fileType": "text/plain", "preview": "hi"}}
+            }).to_string();
+            let (status, _, _) = call(
+                &state,
+                json_request("POST", "/api/localsend/v2/prepare-upload", Some(&message)),
+                peer_addr(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn active_upload_prevents_session_expiry() {
+        let dir = fresh_dir("active-session");
+        let state = make_state(&dir, None);
+        let body = make_prepare_body("2.1", 1);
+        let session = prepare_one(&state, &body).await;
+        {
+            let mut guard = state.inner.lock().await;
+            let session = guard.session.as_mut().unwrap();
+            session.last_activity = Instant::now() - SESSION_IDLE_TIMEOUT;
+            session.files.get_mut("f1").unwrap().uploading = true;
+        }
+        let (status, _, _) = call(
+            &state,
+            json_request("POST", "/api/localsend/v2/prepare-upload", Some(&body)),
+            peer_addr(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        // Completion refreshes the idle deadline for the remaining files.
+        state
+            .inner
+            .lock()
+            .await
+            .session
+            .as_mut()
+            .unwrap()
+            .files
+            .get_mut("f1")
+            .unwrap()
+            .uploading = false;
+        state
+            .inner
+            .lock()
+            .await
+            .session
+            .as_mut()
+            .unwrap()
+            .last_activity = Instant::now();
+        let (status, _, _) = call(
+            &state,
+            upload_request(&session, "f1", Body::from("abcd")),
+            peer_addr(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_upload_times_out_and_removes_partial_file() {
+        let dir = fresh_dir("idle-stream");
+        let state = make_state(&dir, None);
+        let session = prepare_one(&state, &make_prepare_body("2.1", 1)).await;
+        let chunks = futures_util::stream::once(async { Ok::<_, std::io::Error>("ab") })
+            .chain(futures_util::stream::pending());
+        let (status, _, _) = call(
+            &state,
+            upload_request(&session, "f1", Body::from_stream(chunks)),
+            peer_addr(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let guard = state.inner.lock().await;
+        let file = guard.session.as_ref().unwrap().files.get("f1").unwrap();
+        assert!(file.failed);
+        assert!(!file.uploading);
+        drop(guard);
+        // A sender may still retry within the recovery window.
+        let (status, _, _) = call(
+            &state,
+            upload_request(&session, "f1", Body::from("abcd")),
+            peer_addr(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     async fn prepare_one(state: &ServerState, body: &str) -> serde_json::Value {
         let (status, _, response) = call(
             state,

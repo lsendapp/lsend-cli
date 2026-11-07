@@ -18,6 +18,31 @@ pub struct Identity {
 }
 
 impl Identity {
+    fn valid_tls_identity(&self) -> bool {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+        if !fingerprint_from_cert_pem(&self.cert_pem)
+            .is_ok_and(|fingerprint| fingerprint == self.fingerprint)
+        {
+            return false;
+        }
+        let Ok(cert) = CertificateDer::from_pem_slice(self.cert_pem.as_bytes()) else {
+            return false;
+        };
+        let Ok(key) = PrivateKeyDer::from_pem_slice(self.key_pem.as_bytes()) else {
+            return false;
+        };
+        rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .is_ok_and(|builder| {
+            builder
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .is_ok()
+        })
+    }
+
     pub fn load_or_create(config_dir: &Path, https: bool) -> Result<Self> {
         fs::create_dir_all(config_dir).with_context(|| {
             format!("Failed to create config directory {}", config_dir.display())
@@ -35,11 +60,16 @@ impl Identity {
                 .trim()
                 .to_string();
 
-            return Ok(Self {
+            let identity = Self {
                 cert_pem,
                 key_pem,
                 fingerprint,
-            });
+            };
+            // HTTP-only identities have empty PEM files. Upgrade them (and
+            // repair invalid TLS material) before an HTTPS command uses them.
+            if !https || identity.valid_tls_identity() {
+                return Ok(identity);
+            }
         }
 
         let identity = if https {
@@ -88,6 +118,49 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lsend-id-{}-{}", tag, uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn upgrades_http_identity_and_preserves_it_across_mode_switches() {
+        let dir = fresh_dir("upgrade");
+        let http = Identity::load_or_create(&dir, false).unwrap();
+        assert!(http.cert_pem.is_empty());
+        let https = Identity::load_or_create(&dir, true).unwrap();
+        assert!(https.valid_tls_identity());
+        assert_ne!(https.fingerprint, http.fingerprint);
+        let http_again = Identity::load_or_create(&dir, false).unwrap();
+        let https_again = Identity::load_or_create(&dir, true).unwrap();
+        assert_eq!(http_again.fingerprint, https.fingerprint);
+        assert_eq!(https_again.key_pem, https.key_pem);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repairs_invalid_tls_identity() {
+        for file in [CERT_FILE, KEY_FILE, FINGERPRINT_FILE] {
+            let dir = fresh_dir("repair");
+            let original = Identity::load_or_create(&dir, true).unwrap();
+            fs::write(dir.join(file), "invalid").unwrap();
+            let repaired = Identity::load_or_create(&dir, true).unwrap();
+            assert!(repaired.valid_tls_identity());
+            assert_ne!(original.fingerprint, repaired.fingerprint);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn repairs_mismatched_certificate_and_key() {
+        let dir = fresh_dir("mismatched-key");
+        let original = Identity::load_or_create(&dir, true).unwrap();
+        fs::write(
+            dir.join(KEY_FILE),
+            generate_https_identity().unwrap().key_pem,
+        )
+        .unwrap();
+        let repaired = Identity::load_or_create(&dir, true).unwrap();
+        assert!(repaired.valid_tls_identity());
+        assert_ne!(original.fingerprint, repaired.fingerprint);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

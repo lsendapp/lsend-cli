@@ -94,6 +94,14 @@ Files:
 - `alias.txt` — persisted device name (official LocalSend word lists + system locale; override per run with `--alias`; manage with `lsend alias`)
 - `receive_pin` — persisted receive PIN when set via `lsend receive --pin`
 
+Receivers reclaim abandoned sessions after five minutes without an active upload when
+another transfer is requested. Streaming uploads time out after five minutes without
+another data chunk. Active uploads can run longer, and failed files can be retried
+within the idle window. Files already saved are kept when a session expires.
+
+HTTP-only identities are automatically upgraded to a TLS identity on the next HTTPS
+command. Invalid persisted TLS material is regenerated.
+
 Stdout is automatically JSON when piped or when `LSEND_NO_TUI=1` is set (same as `--json`).
 
 ## License

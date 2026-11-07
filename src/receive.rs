@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::signal;
 use tokio::sync::mpsc;
 
@@ -9,7 +9,7 @@ use crate::discovery;
 use crate::events::ReceiveEvent;
 use crate::identity::Identity;
 use crate::output::{OutputOptions, ReceiveEventJson, print_json};
-use crate::server::{ServerState, run_http, run_https};
+use crate::server::{ServerState, spawn_server};
 
 pub async fn run(
     config: AppConfig,
@@ -34,17 +34,16 @@ pub async fn run(
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|_| crate::error::CliError::PortInUse { port: config.port })?;
-    let server_config = config.clone();
-
-    let server_task = tokio::spawn(async move {
-        if server_config.https {
-            run_https(state, listener).await
-        } else {
-            run_http(state, listener).await
+    let shutdown_state = state.clone();
+    let mut server_task = spawn_server(state, listener)?;
+    let responder = match discovery::run_responder(config.clone(), identity).await {
+        Ok(responder) => responder,
+        Err(error) => {
+            shutdown_state.shutdown();
+            let _ = server_task.await;
+            return Err(error);
         }
-    });
-
-    let _responder = discovery::run_responder(config.clone(), identity).await?;
+    };
 
     if output.show_human_progress() {
         println!(
@@ -68,29 +67,33 @@ pub async fn run(
         });
     }
 
-    tokio::select! {
-        _ = signal::ctrl_c() => {},
-        Some(()) = stop_rx.recv() => {},
-    }
+    let (server_result, signal_result) = tokio::select! {
+        result = &mut server_task => (Some(result), Ok(())),
+        result = signal::ctrl_c() => (None, result),
+        Some(()) = stop_rx.recv() => (None, Ok(())),
+    };
+    shutdown_state.shutdown();
+    drop(responder);
+    let server_result = match server_result {
+        Some(result) => result,
+        None => server_task.await,
+    };
 
     if output.show_human_progress() {
         println!("Shutting down...");
     } else if output.is_json() {
         print_json(&ReceiveEventJson::Shutdown);
     }
-    server_task.abort();
-
-    Ok(())
+    server_result.context("Receiver server task failed")??;
+    signal_result.context("Failed to listen for Ctrl+C")
 }
 
 /// Run the receiver with a programmatic event channel. The CLI's `receive`
 /// subcommand uses [`run`]; the desktop app uses this entry point so it can
 /// observe receive-lifecycle events without parsing stdout.
 ///
-/// Returns the server task handle and an event receiver. The caller owns the
-/// task's lifetime: dropping the handle aborts the server. The caller is
-/// also responsible for announcing shutdown on the event channel when it
-/// decides to stop the receiver.
+/// Returns a stop sender and an event receiver. Sending a stop message cancels
+/// uploads, drains connections, and emits Shutdown after cleanup completes.
 pub async fn run_with_events(
     config: AppConfig,
     identity: Identity,
@@ -118,16 +121,8 @@ pub async fn run_with_events(
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|_| crate::error::CliError::PortInUse { port: config.port })?;
-    let server_config = config.clone();
-
-    let server_task = tokio::spawn(async move {
-        let _ = if server_config.https {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-            run_https(state, listener).await
-        } else {
-            run_http(state, listener).await
-        };
-    });
+    let shutdown_state = state.clone();
+    let mut server_task = spawn_server(state, listener)?;
 
     // Start the multicast discovery responder so peers can find us by UDP scan.
     // Failure here is non-fatal for the desktop app: receive still works for
@@ -148,21 +143,62 @@ pub async fn run_with_events(
         receive_dir: config.receive_dir.clone(),
     });
 
-    // Supervisor: translate the caller's stop signal into a Shutdown event
-    // (the server task itself has no lifecycle hook for it) and tear down
-    // the server + discovery tasks so the process can idle. `stop_rx` fires
-    // both on an explicit stop message and when `stop_tx` is dropped, so the
-    // desktop app's "quit" path works either way.
-    {
-        let event_tx = event_tx.clone();
-        tokio::spawn(async move {
-            let _ = stop_rx.recv().await;
+    // Keep the event channel open until every connection has finished cleanup.
+    tokio::spawn(async move {
+        let stopped = tokio::select! {
+            _ = stop_rx.recv() => true,
+            result = &mut server_task => {
+                tracing::warn!(?result, "receiver server stopped");
+                false
+            }
+        };
+        shutdown_state.shutdown();
+        drop(responder_handle);
+        if stopped {
+            let _ = server_task.await;
+        }
+        drop(shutdown_state);
+        if stopped {
             let _ = event_tx.send(ReceiveEvent::Shutdown);
-            server_task.abort();
-            // MulticastGuard aborts its listener tasks on drop.
-            drop(responder_handle);
-        });
-    }
+        }
+    });
 
     Ok((stop_tx, event_rx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn invalid_tls_fails_before_cli_or_event_receiver_is_ready() {
+        let dir = std::env::temp_dir().join(format!("lsend-startup-{}", uuid::Uuid::new_v4()));
+        let config = AppConfig {
+            alias: "Test".into(),
+            port: 0,
+            https: true,
+            multicast_group: crate::config::DEFAULT_MULTICAST_GROUP.into(),
+            config_dir: dir.clone(),
+            receive_dir: dir,
+        };
+        let identity = Identity {
+            cert_pem: String::new(),
+            key_pem: String::new(),
+            fingerprint: "test".into(),
+        };
+        let error = run(
+            config.clone(),
+            identity.clone(),
+            None,
+            OutputOptions::new(true, true),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("Failed to parse certificate"));
+        let error = run_with_events(config, identity, None, crate::output::OutputMode::Json)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Failed to parse certificate"));
+    }
 }

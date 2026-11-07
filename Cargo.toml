@@ -46,5 +46,6 @@ sys-locale = "0.3"
 arboard = "3"
 
 [dev-dependencies]
+tokio = { version = "1.49", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
