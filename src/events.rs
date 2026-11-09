@@ -49,6 +49,13 @@ pub enum ReceiveEvent {
     /// The session ended with at least one failed file; others may have saved.
     TransferFinishedWithErrors,
 
+    /// The receiver rejected a transfer before creating a session (e.g. the
+    /// sender is not in the pairing list, or the pairing store is unreadable).
+    TransferRejected {
+        sender_alias: String,
+        reason: &'static str,
+    },
+
     /// The sender cancelled mid-session.
     TransferCancelled,
 

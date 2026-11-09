@@ -173,6 +173,9 @@ pub struct SendFileResult {
     pub path: String,
     pub size: u64,
     pub status: &'static str,
+    /// Failure reason when `status` is "failed".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -223,8 +226,50 @@ pub enum ReceiveEventJson {
     },
     TransferComplete,
     TransferFinishedWithErrors,
+    /// The receiver rejected a transfer before creating a session (e.g. the
+    /// sender is not in the pairing list).
+    TransferRejected {
+        sender_alias: String,
+        reason: &'static str,
+    },
     TransferCancelled,
     Shutdown,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PairedDeviceJson {
+    pub alias: String,
+    pub fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_model: Option<String>,
+    /// Unix seconds when the device was paired.
+    pub paired_at: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PairListResult {
+    pub command: &'static str,
+    pub action: &'static str,
+    pub ok: bool,
+    pub devices: Vec<PairedDeviceJson>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PairAddResult {
+    pub command: &'static str,
+    pub action: &'static str,
+    pub ok: bool,
+    /// False when the device was already paired (metadata refreshed).
+    pub created: bool,
+    pub device: PairedDeviceJson,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PairRemoveResult {
+    pub command: &'static str,
+    pub action: &'static str,
+    pub ok: bool,
+    pub device: PairedDeviceJson,
 }
 
 #[cfg(test)]
@@ -299,6 +344,7 @@ mod tests {
                     path: "/tmp/file.pdf".to_string(),
                     size: 1024,
                     status: "finished",
+                    error: None,
                 }],
             },
         };
@@ -483,10 +529,35 @@ mod tests {
             path: "/tmp/a.txt".into(),
             size: 10,
             status: "skipped",
+            error: None,
         };
         let json = serde_json::to_string(&r).expect("serialize");
         assert!(json.contains("\"status\":\"skipped\""));
         assert!(json.contains("\"size\":10"));
+    }
+
+    #[test]
+    fn send_file_result_serializes_error_only_when_present() {
+        let ok = SendFileResult {
+            name: "a.txt".into(),
+            path: "/tmp/a.txt".into(),
+            size: 10,
+            status: "finished",
+            error: None,
+        };
+        let json = serde_json::to_string(&ok).expect("serialize");
+        assert!(!json.contains("\"error\""));
+
+        let failed = SendFileResult {
+            name: "a.txt".into(),
+            path: "/tmp/a.txt".into(),
+            size: 10,
+            status: "failed",
+            error: Some("500 Internal Server Error".into()),
+        };
+        let json = serde_json::to_string(&failed).expect("serialize");
+        assert!(json.contains("\"status\":\"failed\""));
+        assert!(json.contains("\"error\":\"500 Internal Server Error\""));
     }
 
     #[test]

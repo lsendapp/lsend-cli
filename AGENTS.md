@@ -31,7 +31,7 @@ Machine-readable, non-interactive CLI for the LocalSend protocol.
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | General error (`code: "error"`) |
+| 1 | General error (`code: "error"`, `transfer_declined`, partial send failures) |
 | 2 | Not found / validation (`target_not_found`, `no_files`, `invalid_alias`) |
 | 3 | Port in use (`port_in_use`) |
 
@@ -124,16 +124,43 @@ Message send (`--text`, `--message`, `--clipboard`):
 
 `resolved_via`: `"ip"` (preferred) or `"scan"` (alias triggered discovery).
 
+`files[].status`:
+
+| Status | Meaning |
+|--------|---------|
+| `finished` | Uploaded and acknowledged by the receiver |
+| `skipped` | Receiver did not accept this file (no upload token issued) |
+| `failed` | Upload attempted and failed; sibling `error` field carries the reason |
+
+Multi-file sends **continue after a per-file failure**: every accepted file is
+attempted, the result document carries per-file statuses with `ok: false` when
+any file failed, and the exit code is `1`. A file send answered by `204` (the
+receiver accepted no files) fails with `code: "transfer_declined"`.
+
+Integrity: each file's sha256 is announced in prepare-upload; a verifying
+receiver answers `422` on mismatch, which surfaces as a `failed` file.
+
 ## receive
 
 ```bash
 lsend receive --json --once --dir /tmp/inbox
 lsend receive --json --once --pin 123456 --dir /tmp/inbox
+lsend receive --json --once --accept-unpaired --dir /tmp/inbox
 ```
 
 Receive PIN priority: `--pin` (persisted to `receive_pin`) > config file > `LSEND_RECEIVE_PIN` env.
 
 NDJSON events: `ready` → `transfer_started` → `file_saved` → `transfer_complete` → `shutdown`
+
+While a pair list exists, an unpaired sender is rejected before a session is
+created: `{"event":"transfer_rejected","sender_alias":"...","reason":"not_paired"}`
+and the sender receives HTTP 403. `--accept-unpaired` disables the gate for
+one run. See [pair](#pair).
+
+Received files are verified against the sender's announced sha256; on mismatch
+the sender gets `422` and the partial file is discarded. Peer-supplied names
+are sanitized per path segment (reserved names, illegal characters) while
+preserving the sender's directory structure.
 
 ## Errors (`--json`)
 
@@ -146,6 +173,28 @@ NDJSON events: `ready` → `transfer_started` → `file_saved` → `transfer_com
   "hint": "Run `lsend scan --json` first and use the device IP, or pass an IP address directly."
 }
 ```
+
+## pair
+
+Manage the paired-device trust list stored at `~/.config/lsend/paired.json`
+(shared with the desktop app; reloaded per transfer, so changes apply live).
+
+```bash
+lsend pair list --json
+lsend pair add 192.168.1.10 --json        # discovers the peer, stores its fingerprint
+lsend pair remove "Cute Apple" --json     # by alias or fingerprint
+```
+
+Semantics:
+
+- Empty or missing `paired.json` → receive auto-accepts any LAN peer (default).
+- Non-empty list → receive rejects unpaired senders with 403 (`transfer_rejected` event).
+- `receive --accept-unpaired` → one-off override.
+- Removing the last entry returns receive to auto-accept.
+
+`pair add` runs a discovery scan and requires the peer to be present; the
+stored fingerprint is the peer's announced value (not cryptographic proof of
+identity — it stops ordinary unpaired peers, not active spoofers).
 
 ## Agent eval checklist
 

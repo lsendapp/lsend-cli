@@ -44,9 +44,11 @@ pub enum Commands {
         #[command(subcommand)]
         topic: Option<AgentCommand>,
     },
-
     /// Manage the persisted device alias (device name).
     Alias(AliasOpts),
+
+    /// Manage paired devices (receive trust list).
+    Pair(PairOpts),
 
     /// Discover LocalSend devices on the local network.
     Scan {
@@ -93,6 +95,9 @@ pub enum Commands {
         /// Exit after the first completed transfer (recommended for agents).
         #[arg(long)]
         once: bool,
+        /// Accept transfers from unpaired devices even when a pair list exists.
+        #[arg(long)]
+        accept_unpaired: bool,
 
         /// Require this PIN from senders (persisted to config when set).
         #[arg(long)]
@@ -127,6 +132,32 @@ pub enum AliasAction {
     },
 }
 
+#[derive(clap::Args, Debug)]
+#[command(arg_required_else_help = false)]
+pub struct PairOpts {
+    #[command(subcommand)]
+    pub action: Option<PairAction>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PairAction {
+    /// List paired devices (default action).
+    #[command(name = "list")]
+    List,
+
+    /// Pair a device by IP or alias (discovers it on the LAN first).
+    Add {
+        /// Target device IP or alias.
+        target: String,
+    },
+
+    /// Remove a paired device by fingerprint or alias.
+    Remove {
+        /// Fingerprint or alias of the paired device.
+        target: String,
+    },
+}
+
 #[derive(Subcommand, Debug, Clone, Copy, ValueEnum)]
 pub enum AgentCommand {
     /// Device alias management workflow.
@@ -137,6 +168,8 @@ pub enum AgentCommand {
     Send,
     /// Receive workflow; use with --once.
     Receive,
+    /// Paired-device trust list workflow.
+    Pair,
     /// Exit codes and error JSON schema.
     Errors,
     /// Smoke-test checklist for agents.

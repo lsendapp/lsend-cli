@@ -18,8 +18,9 @@ use localsend::http::dto_v2::{
     InfoResponseDtoV2, PrepareUploadResponseDtoV2, RegisterResponseDtoV2,
 };
 use localsend::model::transfer::FileDto;
-use serde::Deserialize;
-use serde::Serialize;
+use localsend::util::filename::{Rules, sanitize as sanitize_segment};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, mpsc, watch};
@@ -51,6 +52,9 @@ pub struct ServerState {
     shutdown: watch::Sender<bool>,
     inner: Arc<Mutex<InnerState>>,
     pin_attempts: Arc<Mutex<HashMap<String, PinAttempts>>>,
+    /// Pairing enforcement override: when true, the pairing gate is skipped
+    /// (`receive --accept-unpaired`). Default false.
+    accept_unpaired: bool,
 }
 
 struct InnerState {
@@ -131,7 +135,14 @@ impl ServerState {
             shutdown: watch::channel(false).0,
             inner: Arc::new(Mutex::new(InnerState { session: None })),
             pin_attempts: Arc::new(Mutex::new(HashMap::new())),
+            accept_unpaired: false,
         }
+    }
+
+    /// Override the pairing gate for this receiver (`--accept-unpaired`).
+    pub fn accept_unpaired(mut self, accept: bool) -> Self {
+        self.accept_unpaired = accept;
+        self
     }
 
     /// Stop accepting work and cancel streaming uploads so their reservations clean up.
@@ -556,6 +567,12 @@ async fn prepare_upload_handler(
         }
     };
 
+    if let Some(response) =
+        check_pairing(&state, &request.sender_fingerprint, &request.sender_alias)
+    {
+        return response;
+    }
+
     if request.files.is_empty() {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -582,7 +599,7 @@ async fn prepare_upload_handler(
 
     for (id, file) in request.files {
         let token = Uuid::new_v4().to_string();
-        let desired_name = file.file_name.clone();
+        let desired_name = sanitize_relative_name(&file.file_name);
         response_files.insert(id.clone(), token.clone());
         session_files.insert(
             id,
@@ -650,6 +667,9 @@ async fn prepare_upload_handler(
 struct ParsedPrepareUpload {
     sender_alias: String,
     sender_version: String,
+    /// Sender identity from the `fingerprint` (v2) or `token` (v1) info field.
+    /// May be empty for peers that announce neither.
+    sender_fingerprint: String,
     files: HashMap<String, FileDto>,
 }
 
@@ -682,6 +702,16 @@ struct PrepareUploadInfoCompat {
     download: Option<bool>,
     #[serde(default, rename = "hasWebInterface")]
     has_web_interface: Option<bool>,
+}
+
+impl PrepareUploadInfoCompat {
+    fn fingerprint(&self) -> String {
+        if !self.fingerprint.is_empty() {
+            self.fingerprint.clone()
+        } else {
+            self.token.clone()
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -745,9 +775,11 @@ fn parse_prepare_upload_request(
         for (id, file) in dto.files {
             files.insert(id.clone(), file.into_file_dto(&id));
         }
+        let sender_fingerprint = dto.info.fingerprint();
         return Ok(ParsedPrepareUpload {
             sender_alias: dto.info.alias,
             sender_version: dto.info.version.unwrap_or_else(|| "1.0".to_string()),
+            sender_fingerprint,
             files,
         });
     }
@@ -774,6 +806,7 @@ fn parse_prepare_upload_request(
     Ok(ParsedPrepareUpload {
         sender_alias: alias,
         sender_version: version,
+        sender_fingerprint: read_string_field(info, &["fingerprint", "token"]).unwrap_or_default(),
         files,
     })
 }
@@ -974,16 +1007,18 @@ async fn upload_handler(
 
     let active_session_id = session.session_id.clone();
     let expected_size = entry.file.size;
+    let expected_sha256 = entry.file.sha256.clone();
     let desired_name = entry.desired_name.clone();
     let destination_dir = session.destination_dir.clone();
     drop(guard);
 
     // Reserve and open the destination in a blocking task. cap-std resolves
     // every path relative to a directory handle and disallows escapes.
+    let reserve_name = desired_name.clone();
     let reserve_result = match validate_relative_file_name(&desired_name) {
         Err(message) => Err((StatusCode::FORBIDDEN, message)),
         Ok(()) => tokio::task::spawn_blocking(move || {
-            reserve_receive_file(&destination_dir, &desired_name)
+            reserve_receive_file(&destination_dir, &reserve_name)
         })
         .await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
@@ -1001,7 +1036,12 @@ async fn upload_handler(
                 _ = shutdown.wait_for(|stopped| *stopped) => {
                     Err((StatusCode::SERVICE_UNAVAILABLE, "Receiver shutting down".to_owned()))
                 }
-                result = save_stream(body, reserved.as_mut().unwrap(), expected_size) => result,
+                result = save_stream(
+                    body,
+                    reserved.as_mut().unwrap(),
+                    expected_size,
+                    expected_sha256.as_deref(),
+                ) => result,
             }
         }
         Err(error) => Err(error),
@@ -1051,7 +1091,12 @@ async fn upload_handler(
         }
         Err(e) => {
             entry.failed = true;
-            Some(e)
+            let (status, message) = e;
+            state.notify_human(format!(
+                "Failed to save {desired_name} ({} {message})",
+                status.as_u16()
+            ));
+            Some((status, message))
         }
     };
 
@@ -1152,10 +1197,12 @@ async fn save_stream(
     body: Body,
     reserved: &mut ReservedReceiveFile,
     expected_size: u64,
+    expected_sha256: Option<&str>,
 ) -> Result<u64, (StatusCode, String)> {
     let mut file = File::from_std(reserved.file.take().expect("reserved file"));
     let mut stream = body.into_data_stream();
     let mut total = 0u64;
+    let mut hasher = Sha256::new();
     let io_error = |e: std::io::Error| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
 
     while let Some(chunk) = tokio::time::timeout(SESSION_IDLE_TIMEOUT, stream.next())
@@ -1169,6 +1216,7 @@ async fn save_stream(
                 "Upload exceeds advertised size".into(),
             ));
         }
+        hasher.update(&chunk);
         file.write_all(&chunk).await.map_err(io_error)?;
         total += chunk.len() as u64;
     }
@@ -1179,6 +1227,14 @@ async fn save_stream(
         ));
     }
     file.flush().await.map_err(io_error)?;
+    if let Some(expected) = expected_sha256 {
+        // Protocol SHOULD: verify against the announced sha256 and reject
+        // with 422 so corruption is never written silently.
+        let actual = hex::encode(hasher.finalize());
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, "Checksum mismatch".into()));
+        }
+    }
     Ok(total)
 }
 
@@ -1241,6 +1297,25 @@ fn validate_relative_file_name(file_name: &str) -> Result<(), String> {
         return Err("Path traversal is not allowed".to_string());
     }
     Ok(())
+}
+
+/// Sanitize a peer-supplied relative file name segment-wise with the vendored
+/// core's platform rules (reserved names, trailing dots/spaces, control
+/// characters, illegal chars, 255-byte truncation) while preserving the
+/// sender's directory structure. `validate_relative_file_name` still rejects
+/// absolute paths and traversal at reserve time as defense in depth.
+fn sanitize_relative_name(name: &str) -> String {
+    let rules = Rules::current();
+    let parts: Vec<String> = Path::new(name)
+        .iter()
+        .map(|segment| sanitize_segment(&segment.to_string_lossy(), rules))
+        .collect();
+    let joined = parts.join("/");
+    if joined.is_empty() {
+        "untitled".to_string()
+    } else {
+        joined
+    }
 }
 
 fn info_response_json(state: &ServerState) -> InfoResponseJson {
@@ -1341,6 +1416,60 @@ async fn check_pin(
             } else {
                 Some(error_response(StatusCode::UNAUTHORIZED, "Invalid PIN"))
             }
+        }
+    }
+}
+
+/// Pairing gate for prepare-upload: reject transfers from senders that are
+/// not in `paired.json` while that list is non-empty. Returns the error
+/// response to send, or `None` to allow.
+fn check_pairing(
+    state: &ServerState,
+    sender_fingerprint: &str,
+    sender_alias: &str,
+) -> Option<Response> {
+    if state.accept_unpaired {
+        return None;
+    }
+    match crate::pairing::enforce(&state.config.config_dir, sender_fingerprint) {
+        Ok(()) => None,
+        Err(crate::pairing::EnforceError::NotPaired) => {
+            state.notify_human(format!(
+                "Rejected transfer from unpaired device {sender_alias}"
+            ));
+            tracing::warn!(
+                "Rejected transfer from unpaired device {sender_alias} ({sender_fingerprint:?})"
+            );
+            if state.output == OutputMode::Json {
+                state.emit_json_event(ReceiveEventJson::TransferRejected {
+                    sender_alias: sender_alias.to_string(),
+                    reason: "not_paired",
+                });
+            }
+            state.emit_event(ReceiveEvent::TransferRejected {
+                sender_alias: sender_alias.to_string(),
+                reason: "not_paired",
+            });
+            Some(error_response(StatusCode::FORBIDDEN, "Device not paired"))
+        }
+        Err(crate::pairing::EnforceError::StoreUnreadable(error)) => {
+            // Fail closed: a corrupted store must not silently open the door.
+            tracing::error!("Pairing store unreadable, rejecting transfer: {error:#}");
+            state.notify_human("Rejecting transfers: the pairing store is unreadable.");
+            if state.output == OutputMode::Json {
+                state.emit_json_event(ReceiveEventJson::TransferRejected {
+                    sender_alias: sender_alias.to_string(),
+                    reason: "pairing_store_unreadable",
+                });
+            }
+            state.emit_event(ReceiveEvent::TransferRejected {
+                sender_alias: sender_alias.to_string(),
+                reason: "pairing_store_unreadable",
+            });
+            Some(error_response(
+                StatusCode::FORBIDDEN,
+                "Pairing store unreadable on receiver",
+            ))
         }
     }
 }
@@ -1819,13 +1948,16 @@ mod integration_tests {
     use tower::ServiceExt;
 
     fn make_state(receive_dir: &std::path::Path, pin: Option<String>) -> ServerState {
-        let cfg = AppConfig::new(
+        let mut cfg = AppConfig::new(
             Some("Tester".into()),
             53317,
             true,
             Some(receive_dir.to_path_buf()),
         )
         .expect("config");
+        // Point the config dir at the test directory so pairing reads never
+        // touch the developer's real `paired.json`.
+        cfg.config_dir = receive_dir.to_path_buf();
         let identity = Identity {
             cert_pem: String::new(),
             key_pem: String::new(),
@@ -1915,7 +2047,7 @@ mod integration_tests {
         assert_eq!(status, StatusCode::OK);
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["alias"], "Tester");
-        assert_eq!(json["version"], "2.1");
+        assert_eq!(json["version"], "2.2");
         assert_eq!(json["deviceType"], "headless");
         assert_eq!(json["fingerprint"], "test-fp");
         assert_eq!(json["download"], false);
@@ -2993,5 +3125,145 @@ mod integration_tests {
             StatusCode::OK
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_with_matching_sha256_saves_file() {
+        let dir = fresh_dir("sha-ok");
+        let state = make_state(&dir, None);
+        let digest = localsend::crypto::hash::sha256_hex(b"abcd");
+        let body = format!(
+            r#"{{"info":{{"alias":"Sender","version":"2.2","fingerprint":"sfp"}},
+                "files":{{"f1":{{"id":"f1","fileName":"a0.bin","size":4,
+                "fileType":"application/octet-stream","sha256":"{digest}"}}}}}}"#
+        );
+        let session = prepare_one(&state, &body).await;
+        let (status, _, _) = call(
+            &state,
+            upload_request(&session, "f1", Body::from("abcd")),
+            peer_addr(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(std::fs::read(dir.join("a0.bin")).unwrap(), b"abcd");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn upload_with_wrong_sha256_returns_422_and_removes_file() {
+        let dir = fresh_dir("sha-bad");
+        let state = make_state(&dir, None);
+        let body = format!(
+            r#"{{"info":{{"alias":"Sender","version":"2.2","fingerprint":"sfp"}},
+                "files":{{"f1":{{"id":"f1","fileName":"a0.bin","size":4,
+                "fileType":"application/octet-stream","sha256":"{}"}}}}}}"#,
+            localsend::crypto::hash::sha256_hex(b"tampered")
+        );
+        let session = prepare_one(&state, &body).await;
+        let (status, _, response) = call(
+            &state,
+            upload_request(&session, "f1", Body::from("abcd")),
+            peer_addr(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let json: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(json["message"], "Checksum mismatch");
+        // The corrupted file must not remain on disk.
+        assert!(!dir.join("a0.bin").exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    async fn prepare_status(state: &ServerState, body: &str) -> StatusCode {
+        call(
+            state,
+            json_request("POST", "/api/localsend/v2/prepare-upload", Some(body)),
+            peer_addr(),
+        )
+        .await
+        .0
+    }
+
+    #[tokio::test]
+    async fn unpaired_sender_rejected_when_pair_list_nonempty() {
+        let dir = fresh_dir("pair-closed");
+        let state = make_state(&dir, None);
+        crate::pairing::PairedStore {
+            devices: vec![crate::pairing::PairedDevice {
+                fingerprint: "other-fp".into(),
+                alias: "Trusted".into(),
+                device_model: None,
+                paired_at: 1,
+            }],
+        }
+        .save(&dir)
+        .unwrap();
+
+        let status = prepare_status(&state, &make_prepare_body("2.2", 1)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn paired_sender_accepted_and_accept_unpaired_overrides() {
+        let dir = fresh_dir("pair-open");
+        let state = make_state(&dir, None);
+        crate::pairing::PairedStore {
+            devices: vec![crate::pairing::PairedDevice {
+                fingerprint: "sfp".into(),
+                alias: "Sender".into(),
+                device_model: None,
+                paired_at: 1,
+            }],
+        }
+        .save(&dir)
+        .unwrap();
+
+        let status = prepare_status(&state, &make_prepare_body("2.2", 1)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Drop the trusted entry; the --accept-unpaired override still lets it in.
+        crate::pairing::PairedStore::default().save(&dir).unwrap();
+        crate::pairing::PairedStore {
+            devices: vec![crate::pairing::PairedDevice {
+                fingerprint: "other-fp".into(),
+                alias: "Trusted".into(),
+                device_model: None,
+                paired_at: 1,
+            }],
+        }
+        .save(&dir)
+        .unwrap();
+        let open_state = make_state(&dir, None).accept_unpaired(true);
+        let status = prepare_status(&open_state, &make_prepare_body("2.2", 1)).await;
+        assert_eq!(status, StatusCode::OK);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn corrupt_pair_store_fails_closed_with_403() {
+        let dir = fresh_dir("pair-corrupt");
+        let state = make_state(&dir, None);
+        std::fs::write(dir.join("paired.json"), "{not json").unwrap();
+
+        let status = prepare_status(&state, &make_prepare_body("2.2", 1)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn sanitize_relative_name_preserves_dirs_and_strips_illegal_chars() {
+        // Directory structure survives.
+        assert_eq!(
+            sanitize_relative_name("photos/vacation/beach.jpg"),
+            "photos/vacation/beach.jpg"
+        );
+        // A traversal-shaped name is still rejected later by
+        // validate_relative_file_name; sanitization only handles characters.
+        let sanitized = sanitize_relative_name("bad:name?.txt");
+        assert_ne!(sanitized, "bad:name?.txt");
+        assert!(sanitized.ends_with(".txt"), "got: {sanitized}");
+        // A name made only of separators/dots still yields a usable leaf.
+        assert!(!sanitize_relative_name("...").is_empty());
     }
 }

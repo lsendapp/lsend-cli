@@ -6,6 +6,7 @@ pub enum CliError {
     TargetNotFound { target: String },
     NoFiles,
     InvalidAlias { reason: String },
+    TransferDeclined { target: String },
     Other(String),
 }
 
@@ -16,6 +17,7 @@ impl CliError {
             Self::TargetNotFound { .. } => "target_not_found",
             Self::NoFiles => "no_files",
             Self::InvalidAlias { .. } => "invalid_alias",
+            Self::TransferDeclined { .. } => "transfer_declined",
             Self::Other(_) => "error",
         }
     }
@@ -24,7 +26,7 @@ impl CliError {
         match self {
             Self::PortInUse { .. } => 3,
             Self::TargetNotFound { .. } | Self::NoFiles | Self::InvalidAlias { .. } => 2,
-            Self::Other(_) => 1,
+            Self::TransferDeclined { .. } | Self::Other(_) => 1,
         }
     }
 
@@ -45,6 +47,12 @@ impl CliError {
             ),
             Self::InvalidAlias { .. } => Some(
                 "Provide a non-empty alias up to 255 characters.".to_string(),
+            ),
+            Self::TransferDeclined { .. } => Some(
+                "The receiver replied 204 No Content without accepting any files (busy, or its \
+                 accept rules declined the transfer). Message sends are the only kind completed \
+                 by a 204; retry the file send later or ask the receiver to free the session."
+                    .to_string(),
             ),
             Self::Other(_) => None,
         }
@@ -107,16 +115,16 @@ impl fmt::Display for CliError {
             ),
             Self::NoFiles => write!(f, "No files to send"),
             Self::InvalidAlias { reason } => write!(f, "{reason}"),
+            Self::TransferDeclined { target } => write!(
+                f,
+                "Receiver {target} declined the transfer (204 No Content, no files accepted)"
+            ),
             Self::Other(message) => write!(f, "{message}"),
         }
     }
 }
 
-impl From<CliError> for anyhow::Error {
-    fn from(value: CliError) -> Self {
-        Self::msg(value.to_string())
-    }
-}
+impl std::error::Error for CliError {}
 
 #[cfg(test)]
 mod tests {
@@ -267,5 +275,22 @@ mod tests {
             CliError::PortInUse { port } => assert_eq!(port, 53317),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn transfer_declined_maps_to_exit_one_and_hint() {
+        let err = CliError::TransferDeclined {
+            target: "peer".into(),
+        };
+        assert_eq!(err.code(), "transfer_declined");
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.hint().is_some());
+    }
+
+    #[test]
+    fn anyhow_conversion_preserves_cli_error_type() {
+        let err = CliError::from_anyhow(CliError::TransferDeclined { target: "x".into() }.into());
+        assert!(matches!(err, CliError::TransferDeclined { .. }));
+        assert_eq!(err.code(), "transfer_declined");
     }
 }

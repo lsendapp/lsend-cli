@@ -78,7 +78,7 @@ Check exit code and JSON envelope:
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | General error |
+| 1 | General error (incl. partial send failure, `transfer_declined`) |
 | 2 | Target not found / no files / invalid alias |
 | 3 | Port 53317 in use |
 

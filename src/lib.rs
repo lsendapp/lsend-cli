@@ -11,6 +11,8 @@ pub mod legacy;
 pub mod mtls;
 pub mod network;
 pub mod output;
+pub mod pair_cmd;
+pub mod pairing;
 pub mod port;
 pub mod receive;
 pub mod receive_pin;

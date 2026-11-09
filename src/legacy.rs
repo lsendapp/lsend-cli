@@ -224,9 +224,9 @@ mod tests {
             fingerprint: "old-fp".into(),
         };
         let device = device_from_info(info, "10.0.0.8", 53317, false);
-        // Missing version falls back to the current protocol version (2.1),
+        // Missing version falls back to the current protocol version (2.2),
         // not to the v1.0 fallback used by the Dart InfoDto helper.
-        assert_eq!(device.version, "2.1");
+        assert_eq!(device.version, "2.2");
         assert_eq!(device.device_type, None);
         assert!(!device.https);
     }

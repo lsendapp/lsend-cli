@@ -7,6 +7,7 @@ pub fn print(topic: Option<AgentCommand>) {
         Some(AgentCommand::Scan) => print_scan(),
         Some(AgentCommand::Send) => print_send(),
         Some(AgentCommand::Receive) => print_receive(),
+        Some(AgentCommand::Pair) => print_pair(),
         Some(AgentCommand::Errors) => print_errors(),
         Some(AgentCommand::Eval) => print_eval(),
     }
@@ -22,6 +23,7 @@ Run `lsend agent <topic>` for focused instructions:
   scan      Discover devices on the LAN
   send      Send files to a device
   receive   Accept incoming files
+  pair      Manage the paired-device trust list
   errors    Exit codes and error JSON schema
   eval      Smoke-test checklist for agents
 
@@ -107,7 +109,7 @@ Success stdout (single JSON object):
         "port": 53317,
         "fingerprint": "...",
         "https": true,
-        "version": "2.1",
+        "version": "2.2",
         "device_type": "desktop",
         "device_model": "macOS"
       }}
@@ -174,10 +176,22 @@ kind:
   - "file"    — path-based file transfer
   - "message" — text modes; successful delivery uses status "finished"
 
+files[].status:
+  - "finished" — uploaded and acknowledged by the receiver
+  - "skipped"  — receiver did not accept this file (no token issued)
+  - "failed"   — upload attempted and failed; "error" carries the reason
+
+Multi-file sends continue after a per-file failure: every accepted file is
+attempted, the result reports each status with "ok": false when any file
+failed, and the exit code is 1. A file send answered by 204 (receiver accepted
+no files) fails with code "transfer_declined".
+
+Checksums: each file's sha256 is announced to the receiver; a verifying
+receiver answers 422 on mismatch, which surfaces as a failed file.
+
 resolved_via:
   - "ip"    — target was an IP address (preferred)
   - "scan"  — alias required a discovery scan
-
 Flags:
   --no-scan   Fail if TARGET is not an IP (prevents slow implicit scan)
   --pin PIN   Required when the receiver uses LSEND_RECEIVE_PIN
@@ -193,7 +207,7 @@ fn print_receive() {
         r#"## receive — accept incoming files
 
 Command:
-  lsend receive --json --once [--dir PATH] [--pin PIN]
+  lsend receive --json --once [--dir PATH] [--pin PIN] [--accept-unpaired]
 
 Always use --once for agents so the process exits after the first transfer.
 
@@ -204,10 +218,17 @@ Stdout is NDJSON (one JSON object per line):
   {{"event":"transfer_complete"}}
   {{"event":"shutdown"}}
 
+Transfer rejection (only while a pair list exists; see `lsend agent pair`):
+  {{"event":"transfer_rejected","sender_alias":"...","reason":"not_paired"}}
+  The sender receives HTTP 403; --accept-unpaired disables the gate for this run.
+
 Receive PIN (sender must pass --pin when sending to you):
   lsend receive --json --once --pin 123456
 
 PIN priority: --pin (saved to receive_pin) > config file > LSEND_RECEIVE_PIN env.
+
+Integrity: received files are verified against the sender's announced sha256;
+a mismatch is answered with 422 and the partial file is discarded.
 
 Important:
   - Port is checked before bind; port_in_use errors include a hint with remediation.
@@ -220,13 +241,47 @@ Important:
     );
 }
 
+fn print_pair() {
+    println!(
+        r#"## pair — paired-device trust list
+
+Commands:
+  lsend pair list --json
+  lsend pair add <IP-or-alias> --json     # discovers the peer, stores its fingerprint
+  lsend pair remove <alias-or-fingerprint> --json
+
+Enforcement (shared by CLI and desktop receiver, live-reloaded per transfer):
+  - paired.json empty or missing  -> receive auto-accepts any LAN peer (default)
+  - paired.json has entries       -> receive rejects unpaired senders with 403
+                                     and emits {{"event":"transfer_rejected",...}}
+  - lsend receive --accept-unpaired -> one-off override while the list is non-empty
+
+List JSON:
+  {{
+    "command": "pair",
+    "action": "list",
+    "ok": true,
+    "devices": [
+      {{ "alias": "Cute Apple", "fingerprint": "...", "device_model": "iPhone", "paired_at": 1760000000 }}
+    ]
+  }}
+
+Notes:
+  - `pair add` requires the peer to be discoverable right now (it runs a scan).
+  - The fingerprint is the peer's announced value; it stops ordinary unpaired
+    peers but is not cryptographic proof of identity.
+  - Removing the last entry returns receive to auto-accept.
+"#
+    );
+}
+
 fn print_errors() {
     println!(
         r#"## errors — exit codes and JSON failures
 
 Exit codes:
-  0  success
-  1  general error
+  0  success (all files finished, or skipped by receiver choice)
+  1  general error (includes partial send failures and transfer_declined)
   2  not found (unknown alias, no files, etc.)
   3  port already in use (LocalSend app or another lsend instance)
 
@@ -244,6 +299,7 @@ Error codes (code field):
   target_not_found  — alias not found (use scan + IP, or drop --no-scan)
   no_files          — send called with no paths and no --text/--message/--clipboard
   invalid_alias     — alias set/regenerate validation failed
+  transfer_declined — receiver replied 204 without accepting any file
   error             — other failures
 
 Human mode prints "Error: ..." to stderr; JSON mode prints only the envelope to stdout.

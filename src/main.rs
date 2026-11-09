@@ -11,6 +11,8 @@ mod legacy;
 mod mtls;
 mod network;
 mod output;
+mod pair_cmd;
+mod pairing;
 mod port;
 mod receive;
 mod receive_pin;
@@ -20,15 +22,14 @@ mod server;
 mod text_send;
 mod util;
 
-use anyhow::Result;
-use clap::Parser;
-use tracing_subscriber::EnvFilter;
-
-use crate::cli::{AliasAction, Cli, Commands};
+use crate::cli::{AliasAction, Cli, Commands, PairAction};
 use crate::config::AppConfig;
 use crate::error::CliError;
 use crate::identity::Identity;
 use crate::output::{DeviceJson, OutputOptions, ScanResult, error_envelope, print_json};
+use anyhow::Result;
+use clap::Parser;
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
@@ -73,6 +74,10 @@ async fn run() -> Result<(), i32> {
 
     match cli.command {
         Commands::Agent { .. } | Commands::Alias(_) => unreachable!(),
+        Commands::Pair(opts) => {
+            let action = opts.action.unwrap_or(PairAction::List);
+            return pair_cmd::run(action, &config, &identity, output).await;
+        }
         Commands::Scan { timeout } => cmd_scan(&config, &identity, timeout, output)
             .await
             .map_err(|e| fail("scan", output, e))?,
@@ -94,18 +99,28 @@ async fn run() -> Result<(), i32> {
                 pin: pin.as_deref(),
                 no_scan,
             };
-            send::send_files(&config, &identity, &request, output)
+            let outcome = send::send_files(&config, &identity, &request, output)
                 .await
-                .map_err(|e| fail("send", output, e))?
+                .map_err(|e| fail("send", output, e))?;
+            // Partial failures already printed the per-file result document;
+            // only the exit status remains.
+            if let send::SendOutcome::FailedFiles(_) = outcome {
+                return Err(outcome.exit_code());
+            }
         }
-        Commands::Receive { dir, once, pin } => {
+        Commands::Receive {
+            dir,
+            once,
+            pin,
+            accept_unpaired,
+        } => {
             let mut config = config;
             if let Some(dir) = dir {
                 config.receive_dir = dir.into();
             }
             let receive_pin = receive_pin::resolve(&config.config_dir, pin)
                 .map_err(|e| fail("receive", output, e))?;
-            receive::run(config, identity, receive_pin, output, once)
+            receive::run(config, identity, receive_pin, accept_unpaired, output, once)
                 .await
                 .map_err(|e| fail("receive", output, e))?;
         }

@@ -71,7 +71,10 @@ pub async fn start(
         .context("Failed to load TLS config for discovery server")?;
         let std_listener = listener.into_std()?;
         tokio::spawn(async move {
-            if let Err(e) = axum_server::from_tcp_rustls(std_listener, tls).serve(app).await {
+            if let Err(e) = axum_server::from_tcp_rustls(std_listener, tls)
+                .serve(app)
+                .await
+            {
                 debug!("Discovery HTTPS server stopped: {e}");
             }
         })
@@ -238,7 +241,7 @@ mod tests {
         // protocol spec.
         assert!(json.contains("\"deviceType\":\"headless\""), "got: {json}");
         assert!(json.contains("\"alias\":"));
-        assert!(json.contains("\"version\":\"2.1\""));
+        assert!(json.contains("\"version\":\"2.2\""));
         assert!(json.contains("\"fingerprint\":\"abc123\""));
         assert!(json.contains("\"download\":false"));
         assert!(!json.contains("deviceType\":\"HEADLESS\""));

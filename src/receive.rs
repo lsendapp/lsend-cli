@@ -15,6 +15,7 @@ pub async fn run(
     config: AppConfig,
     identity: Identity,
     receive_pin: Option<String>,
+    accept_unpaired: bool,
     output: OutputOptions,
     once: bool,
 ) -> Result<()> {
@@ -27,7 +28,8 @@ pub async fn run(
         output.mode,
         once,
         Some(stop_tx),
-    );
+    )
+    .accept_unpaired(accept_unpaired);
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     // Bind before spawning so the port is known to be available before
     // discovery announcements go out - no 100 ms sleep guesswork.
@@ -190,6 +192,7 @@ mod tests {
             config.clone(),
             identity.clone(),
             None,
+            false,
             OutputOptions::new(true, true),
             false,
         )

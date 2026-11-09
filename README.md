@@ -34,6 +34,11 @@ lsend alias show
 lsend alias regenerate
 lsend alias set "My Laptop"
 
+# Manage paired devices (receive trust list)
+lsend pair list
+lsend pair add 192.168.1.42
+lsend pair remove 192.168.1.42
+
 # Receive files (auto-accept, saves to ~/Downloads by default)
 lsend receive
 
@@ -59,7 +64,7 @@ lsend send 192.168.1.42 --clipboard
 
 | Subcommand | Flag | Description |
 |------------|------|-------------|
-| `scan` | `--timeout MS` | How long to wait for responses, in milliseconds (default: 1500) |
+| `scan` | `--timeout MS` | Total scan budget in milliseconds (default: 1500) |
 | `send` | `--pin PIN` | PIN when sending to a PIN-protected receiver |
 | `send` | `--no-scan` | Do not scan for alias; use IP or fail fast |
 | `send` | `--text` | Read UTF-8 text from stdin (pipe) |
@@ -67,6 +72,13 @@ lsend send 192.168.1.42 --clipboard
 | `send` | `--clipboard` | Send plain text from the system clipboard |
 | `receive` | `--dir PATH` | Directory where received files are saved (default: Downloads) |
 | `receive` | `--once` | Exit after the first completed transfer |
+| `receive` | `--accept-unpaired` | Accept unpaired senders while a pair list exists |
+
+Multi-file sends continue after a per-file failure; the send result reports
+`finished`, `skipped`, or `failed` per file and exits non-zero when any file
+failed. Sent files carry a sha256 checksum; receivers that verify it answer
+422 on mismatch. Received files are verified the same way, and peer-supplied
+file names are sanitized per path segment while preserving subdirectories.
 
 ## AI agents and automation
 
@@ -93,6 +105,7 @@ Files:
 - `cert.pem`, `key.pem`, `fingerprint.txt` — TLS identity
 - `alias.txt` — persisted device name (official LocalSend word lists + system locale; override per run with `--alias`; manage with `lsend alias`)
 - `receive_pin` — persisted receive PIN when set via `lsend receive --pin`
+- `paired.json` — paired-device trust list (manage with `lsend pair`); while non-empty, `receive` rejects unpaired senders with 403
 
 Receivers reclaim abandoned sessions after five minutes without an active upload when
 another transfer is requested. Streaming uploads time out after five minutes without
