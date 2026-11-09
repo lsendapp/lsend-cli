@@ -43,7 +43,39 @@ impl DiscoveredDevice {
     }
 }
 
-const MULTICAST_MIN_LISTEN_MS: u64 = 3500;
+/// How the total `--timeout` budget is split between the multicast phase and
+/// the legacy HTTP subnet fallback. `--timeout` bounds the WHOLE scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanBudget {
+    /// Milliseconds for announcement bursts + multicast listen.
+    pub multicast_ms: u64,
+    /// Milliseconds reserved at the tail for the HTTP subnet fallback. Zero
+    /// means the fallback cannot run within this budget and is skipped.
+    pub fallback_ms: u64,
+}
+
+/// Announcement burst schedule (matches the LocalSend app).
+const ANNOUNCE_DELAYS_MS: [u64; 3] = [100, 500, 2000];
+/// Floor so a near-zero timeout still leaves time for one burst + listen.
+const MIN_SCAN_BUDGET_MS: u64 = 200;
+/// Tail reserve for the HTTP fallback; only engaged on generous budgets.
+const FALLBACK_RESERVE_MS: u64 = 2000;
+/// Budgets below this spend everything on multicast (an HTTP subnet sweep
+/// cannot fit, so promising one would be a lie).
+const FALLBACK_MIN_TOTAL_MS: u64 = 4000;
+
+pub fn split_scan_budget(timeout_ms: u64) -> ScanBudget {
+    let total = timeout_ms.max(MIN_SCAN_BUDGET_MS);
+    let fallback_ms = if total >= FALLBACK_MIN_TOTAL_MS {
+        FALLBACK_RESERVE_MS.min(total / 2)
+    } else {
+        0
+    };
+    ScanBudget {
+        multicast_ms: total - fallback_ms,
+        fallback_ms,
+    }
+}
 
 pub async fn scan(
     config: &AppConfig,
@@ -72,9 +104,10 @@ async fn scan_inner(
     timeout_ms: u64,
     start_http_server: bool,
 ) -> Result<Vec<DiscoveredDevice>> {
+    let started = std::time::Instant::now();
+    let budget = split_scan_budget(timeout_ms);
     let devices = Arc::new(Mutex::new(HashMap::<String, DiscoveredDevice>::new()));
     let multicast_group: Ipv4Addr = DEFAULT_MULTICAST_GROUP.parse()?;
-    let listen_ms = timeout_ms.max(MULTICAST_MIN_LISTEN_MS);
 
     let discovery_server = if start_http_server {
         match start_discovery_server(config.clone(), identity.clone(), devices.clone()).await {
@@ -98,11 +131,13 @@ async fn scan_inner(
     let announce_sockets = open_multicast_announce_sockets(multicast_group);
 
     debug!(
-        "Scan: {} listen socket(s), {} announce socket(s), port {}, https={}",
+        "Scan: {} listen socket(s), {} announce socket(s), port {}, https={}, budget {}ms multicast + {}ms fallback",
         listen_sockets.len(),
         announce_sockets.len(),
         config.port,
-        config.https
+        config.https,
+        budget.multicast_ms,
+        budget.fallback_ms
     );
 
     let listener = if listen_sockets.is_empty() {
@@ -119,12 +154,25 @@ async fn scan_inner(
         )
     };
 
+    // Announce concurrently with listening; bursts that no longer fit before
+    // the multicast deadline are skipped so the scan honors --timeout.
+    let multicast_deadline = started + Duration::from_millis(budget.multicast_ms);
+    let mut announce_task = None;
     if !announce_sockets.is_empty() {
-        send_announcement(announce_sockets, config, identity, multicast_group).await?;
+        announce_task = Some(tokio::spawn(send_announcement(
+            announce_sockets,
+            config.clone(),
+            identity.clone(),
+            multicast_group,
+            Some(multicast_deadline),
+        )));
     }
 
-    sleep(Duration::from_millis(listen_ms)).await;
+    tokio::time::sleep_until(tokio::time::Instant::from_std(multicast_deadline)).await;
 
+    if let Some(task) = announce_task {
+        task.abort();
+    }
     if let Some(listener) = listener {
         drop(listener);
     }
@@ -133,8 +181,10 @@ async fn scan_inner(
     }
 
     let mut found: Vec<_> = devices.lock().await.values().cloned().collect();
-    if found.is_empty() {
-        found = legacy_http_scan(config, identity).await?;
+    if found.is_empty() && budget.fallback_ms > 0 {
+        let fallback_deadline =
+            started + Duration::from_millis(budget.multicast_ms + budget.fallback_ms);
+        found = legacy_http_scan(config, identity, fallback_deadline).await?;
     }
 
     if found.is_empty() {
@@ -162,9 +212,10 @@ pub async fn run_responder(config: AppConfig, identity: Identity) -> Result<Mult
         }
         if let Err(e) = send_announcement(
             announce_sockets,
-            &announce_config,
-            &announce_identity,
+            announce_config.clone(),
+            announce_identity.clone(),
             multicast_group,
+            None,
         )
         .await
         {
@@ -181,9 +232,10 @@ pub async fn run_responder(config: AppConfig, identity: Identity) -> Result<Mult
             }
             if let Err(e) = send_announcement(
                 sockets,
-                &announce_config,
-                &announce_identity,
+                announce_config.clone(),
+                announce_identity.clone(),
                 multicast_group,
+                None,
             )
             .await
             {
@@ -377,21 +429,27 @@ async fn send_multicast_response(config: &AppConfig, identity: &Identity) -> Res
 
 async fn send_announcement(
     sockets: Vec<Arc<UdpSocket>>,
-    config: &AppConfig,
-    identity: &Identity,
+    config: AppConfig,
+    identity: Identity,
     multicast_group: Ipv4Addr,
+    deadline: Option<std::time::Instant>,
 ) -> Result<()> {
-    let message = build_multicast_message(config, identity, true);
+    let message = build_multicast_message(&config, &identity, true);
     let json = serde_json::to_vec(&message).context("Failed to serialize multicast message")?;
     let dest = SocketAddr::new(multicast_group.into(), config.port);
 
-    for delay_ms in [100u64, 500, 2000] {
+    for delay_ms in ANNOUNCE_DELAYS_MS {
+        if deadline.is_some_and(|deadline| {
+            std::time::Instant::now() + Duration::from_millis(delay_ms) >= deadline
+        }) {
+            break;
+        }
         sleep(Duration::from_millis(delay_ms)).await;
         for socket in &sockets {
-            socket
-                .send_to(&json, dest)
-                .await
-                .context("Failed to send announcement")?;
+            // Best-effort: a single failed interface must not abort discovery.
+            if let Err(e) = socket.send_to(&json, dest).await {
+                warn!("Failed to send announcement burst: {e}");
+            }
         }
     }
 
@@ -774,5 +832,50 @@ mod tests {
         assert!(label.contains("https://"));
         assert!(label.contains("10.0.0.5"));
         assert!(label.contains("53317"));
+    }
+
+    #[test]
+    fn split_scan_budget_short_timeouts_spend_all_on_multicast() {
+        for timeout in [0u64, 200, 500, 1500, 3999] {
+            let budget = split_scan_budget(timeout);
+            assert_eq!(budget.fallback_ms, 0, "timeout {timeout}");
+            assert_eq!(budget.multicast_ms, timeout.max(200), "timeout {timeout}");
+        }
+    }
+
+    #[test]
+    fn split_scan_budget_generous_timeouts_reserve_fallback_tail() {
+        assert_eq!(split_scan_budget(4000).fallback_ms, 2000);
+        assert_eq!(split_scan_budget(4000).multicast_ms, 2000);
+        assert_eq!(split_scan_budget(5000).fallback_ms, 2000);
+        assert_eq!(split_scan_budget(5000).multicast_ms, 3000);
+        assert_eq!(split_scan_budget(20000).fallback_ms, 2000);
+        assert_eq!(split_scan_budget(20000).multicast_ms, 18000);
+    }
+
+    /// Regression for the 15.3 s scan: a 300 ms budget must complete in well
+    /// under two seconds (multicast only, no HTTP fallback, no 3.5 s floor).
+    #[tokio::test]
+    async fn scan_passive_honors_small_timeout_budget() {
+        let config = AppConfig {
+            alias: "Budget".into(),
+            port: 53317,
+            https: true,
+            multicast_group: DEFAULT_MULTICAST_GROUP.into(),
+            config_dir: std::env::temp_dir(),
+            receive_dir: std::env::temp_dir(),
+        };
+        let identity = Identity {
+            cert_pem: String::new(),
+            key_pem: String::new(),
+            fingerprint: "budget-test".into(),
+        };
+        let started = std::time::Instant::now();
+        let _devices = scan_passive(&config, &identity, 300).await.expect("scan");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "scan with 300ms budget took {elapsed:?}"
+        );
     }
 }

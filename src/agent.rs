@@ -95,7 +95,8 @@ Command:
   lsend scan --json [--timeout MS]
 
 Defaults:
-  timeout: 1500 ms (multicast wait is at least 3500 ms internally)
+  timeout: 1500 ms (bounds the WHOLE scan: announcements + multicast listen,
+  and a bounded HTTP subnet fallback when the budget is >= 4000 ms)
 
 Success stdout (single JSON object):
   {{
@@ -118,6 +119,7 @@ Success stdout (single JSON object):
 
 Notes:
   - Empty devices[] with ok:true means no peers were found (not an error).
+  - A scan returns in roughly --timeout regardless of network conditions.
   - Prefer device.ip for subsequent send commands (avoid alias rescan).
   - Do not run scan while debugging with -v unless you need stderr logs.
 "#

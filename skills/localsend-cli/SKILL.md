@@ -43,6 +43,9 @@ lsend scan --json --timeout 5000
 
 Parse `.devices[].ip` from the JSON object. Prefer IP over alias for send.
 
+`--timeout` bounds the whole scan; it returns in roughly that time. The HTTP
+subnet fallback only runs for budgets ≥ 4000 ms.
+
 ## Send files (preferred path)
 
 ```bash

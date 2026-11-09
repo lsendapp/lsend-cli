@@ -52,6 +52,10 @@ lsend scan --json --timeout 5000
 
 Empty `devices` with `ok: true` is not an error.
 
+`--timeout` bounds the **whole** scan (announcement bursts + multicast listen +
+optional HTTP fallback). Budgets under 4000 ms skip the subnet fallback; larger
+budgets reserve its tail (up to 2000 ms) for it.
+
 ## alias
 
 Manage the persisted device alias (the LocalSend app UI: **Device name**). Stored in `~/.config/lsend/alias.txt`.

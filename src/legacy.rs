@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use localsend::model::discovery::ProtocolType;
 use serde::Deserialize;
-use tokio::time::timeout;
 use tracing::info;
 
 use crate::config::AppConfig;
@@ -15,11 +14,24 @@ use crate::util::parse_device_type;
 const MAX_SUBNETS: usize = 3;
 const SCAN_CONCURRENCY: usize = 50;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(750);
+/// Do not even start the fallback when less than this remains; one HTTPS+HTTP
+/// probe round cannot complete below it.
+const MIN_FALLBACK_START_MS: u64 = 300;
 
+/// HTTP subnet fallback for networks where multicast discovery fails.
+/// Strictly bounded by `deadline`: each probe uses at most the remaining
+/// budget and the sweep stops (returning what it found) once time is out.
 pub async fn legacy_http_scan(
     config: &AppConfig,
     identity: &Identity,
+    deadline: std::time::Instant,
 ) -> anyhow::Result<Vec<DiscoveredDevice>> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.as_millis() < u128::from(MIN_FALLBACK_START_MS) {
+        info!("Skipping HTTP subnet fallback: scan budget exhausted");
+        return Ok(Vec::new());
+    }
+
     let raw = build_reqwest_client(identity, config.https)?;
 
     let interfaces = list_ipv4_interfaces();
@@ -28,8 +40,9 @@ pub async fn legacy_http_scan(
     }
 
     info!(
-        "Multicast found no devices; running HTTP subnet scan on {} interface(s)",
-        interfaces.len().min(MAX_SUBNETS)
+        "Multicast found no devices; running HTTP subnet scan on {} interface(s) with {}ms budget",
+        interfaces.len().min(MAX_SUBNETS),
+        remaining.as_millis()
     );
 
     let mut targets = Vec::new();
@@ -43,9 +56,22 @@ pub async fn legacy_http_scan(
     let prefer_https = config.https;
 
     for chunk in targets.chunks(SCAN_CONCURRENCY) {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            info!("HTTP subnet scan stopped: scan budget exhausted");
+            break;
+        }
+        let probe_timeout = PROBE_TIMEOUT.min(remaining);
         let mut probes = Vec::with_capacity(chunk.len());
         for ip in chunk {
-            probes.push(probe_device(&raw, ip, port, prefer_https, &fingerprint));
+            probes.push(probe_device(
+                &raw,
+                ip,
+                port,
+                prefer_https,
+                &fingerprint,
+                probe_timeout,
+            ));
         }
         for device in futures_util::future::join_all(probes)
             .await
@@ -65,6 +91,7 @@ async fn probe_device(
     port: u16,
     prefer_https: bool,
     fingerprint: &str,
+    timeout: Duration,
 ) -> Option<DiscoveredDevice> {
     let protocols = if prefer_https {
         [ProtocolType::Https, ProtocolType::Http]
@@ -73,7 +100,7 @@ async fn probe_device(
     };
 
     for protocol in protocols {
-        if let Some(device) = probe_info(client, protocol, ip, port, fingerprint).await {
+        if let Some(device) = probe_info(client, protocol, ip, port, fingerprint, timeout).await {
             return Some(device);
         }
     }
@@ -87,6 +114,7 @@ async fn probe_info(
     ip: &str,
     port: u16,
     fingerprint: &str,
+    timeout: Duration,
 ) -> Option<DiscoveredDevice> {
     let https = protocol == ProtocolType::Https;
     let url = format!(
@@ -94,7 +122,7 @@ async fn probe_info(
         protocol.as_str()
     );
 
-    let response = timeout(PROBE_TIMEOUT, client.get(&url).send())
+    let response = tokio::time::timeout(timeout, client.get(&url).send())
         .await
         .ok()
         .and_then(|r| r.ok())?;
