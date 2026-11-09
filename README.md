@@ -82,7 +82,7 @@ file names are sanitized per path segment while preserving subdirectories.
 
 ## AI agents and automation
 
-- **`lsend agent`** — offline progressive docs (`alias`, `scan`, `send`, `receive`, `errors`, `eval`)
+- **`lsend agent`** — offline progressive docs (`alias`, `scan`, `send`, `receive`, `pair`, `errors`, `eval`)
 - **[AGENTS.md](AGENTS.md)** — JSON schemas and exit codes
 - **`skills/localsend-cli/SKILL.md`** — Cursor agent skill (copy to `.cursor/skills/`)
 

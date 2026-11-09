@@ -2,7 +2,7 @@
 
 Machine-readable, non-interactive CLI for the LocalSend protocol.
 
-**Progressive docs (offline):** `lsend agent [alias|scan|send|receive|errors|eval]`
+**Progressive docs (offline):** `lsend agent [alias|scan|send|receive|pair|errors|eval]`
 
 **Cursor skill:** `skills/localsend-cli/SKILL.md` (install to `.cursor/skills/` or use `npx skills add` if published)
 
