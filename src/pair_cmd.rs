@@ -28,39 +28,44 @@ pub async fn run(
 
 fn run_list(config_dir: &Path, output: OutputOptions) -> Result<(), i32> {
     let store = PairedStore::load(config_dir).map_err(|e| fail("pair", output, e))?;
-    let devices: Vec<PairedDeviceJson> = store
-        .devices
-        .iter()
-        .map(|d| PairedDeviceJson {
-            alias: d.alias.clone(),
-            fingerprint: d.fingerprint.clone(),
-            device_model: d.device_model.clone(),
-            paired_at: d.paired_at,
-        })
-        .collect();
+    let result = pair_list_result(&store);
 
     if output.is_json() {
-        print_json(&PairListResult {
-            command: "pair",
-            action: "list",
-            ok: true,
-            devices,
-        });
+        print_json(&result);
     } else if output.show_human_progress() {
-        if devices.is_empty() {
+        if result.devices.is_empty() {
             println!("No paired devices. Receive accepts any LAN peer while this list is empty.");
         } else {
-            for device in &devices {
+            for device in &result.devices {
                 println!("{} ({})", device.alias, device.fingerprint);
             }
         }
     } else {
-        for device in &devices {
+        for device in &result.devices {
             println!("{}", device.fingerprint);
         }
     }
 
     Ok(())
+}
+
+/// Build the `pair list` result document shared by JSON and human output.
+fn pair_list_result(store: &PairedStore) -> PairListResult {
+    PairListResult {
+        command: "pair",
+        action: "list",
+        ok: true,
+        devices: store
+            .devices
+            .iter()
+            .map(|d| PairedDeviceJson {
+                alias: d.alias.clone(),
+                fingerprint: d.fingerprint.clone(),
+                device_model: d.device_model.clone(),
+                paired_at: d.paired_at,
+            })
+            .collect(),
+    }
 }
 
 async fn run_add(
@@ -211,5 +216,39 @@ mod tests {
         let code = run_remove("ghost", &dir, OutputOptions::new(true, true)).unwrap_err();
         assert_eq!(code, 2);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn list_json_shape_matches_agent_contract() {
+        let store = PairedStore {
+            devices: vec![
+                PairedDevice {
+                    fingerprint: "AA:11".to_string(),
+                    alias: "Laptop".to_string(),
+                    device_model: None,
+                    paired_at: 1_730_000_000,
+                },
+                PairedDevice {
+                    fingerprint: "BB:22".to_string(),
+                    alias: "Pixel".to_string(),
+                    device_model: Some("Pixel 8".to_string()),
+                    paired_at: 1_730_000_001,
+                },
+            ],
+        };
+
+        let json = serde_json::to_value(pair_list_result(&store)).unwrap();
+
+        assert_eq!(json["command"], "pair");
+        assert_eq!(json["action"], "list");
+        assert_eq!(json["ok"], true);
+        let devices = json["devices"].as_array().unwrap();
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0]["alias"], "Laptop");
+        assert_eq!(devices[0]["fingerprint"], "AA:11");
+        assert_eq!(devices[0]["paired_at"], 1_730_000_000);
+        // device_model must be absent, not null, when unknown.
+        assert!(devices[0].get("device_model").is_none());
+        assert_eq!(devices[1]["device_model"], "Pixel 8");
     }
 }
