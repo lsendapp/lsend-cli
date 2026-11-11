@@ -35,12 +35,12 @@ jobs:
         include:
         # Apple silicon
         - target: aarch64-apple-darwin
-          os: macos-14
+          os: macos-15
           archive: tar.gz
           bin: lsend
         # Apple Intel
         - target: x86_64-apple-darwin
-          os: macos-14
+          os: macos-15
           archive: tar.gz
           bin: lsend
         # Linux x86_64 (musl — static binary via Zig cross-compile)
@@ -74,18 +74,26 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
+      # Direct download instead of mlugg/setup-zig: that action still targets
+      # Node 20 (no node24 release), and the runner only needs the Zig
+      # tarball on PATH for cargo-zigbuild. Version pinned to 0.14.1.
       - name: Install Zig (Linux only)
         if: matrix.os == 'ubuntu-22.04'
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.14.1
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local"
+          curl -fsSL https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz \
+            | tar -xJ -C "$HOME/.local"
+          echo "$HOME/.local/zig-x86_64-linux-0.14.1" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/zig-x86_64-linux-0.14.1:$PATH"
+          zig version
 
       - name: Install cargo-zigbuild (Linux only)
         if: matrix.os == 'ubuntu-22.04'
